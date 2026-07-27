@@ -1,0 +1,130 @@
+# Build @promptsign/verify's native addon for every supported platform and
+# publish the platform packages + the main package to npm, with provenance.
+#
+# Trigger by pushing a tag like `verify-v0.2.0` (or run manually). Requires an
+# NPM_TOKEN secret with publish rights to the @promptsign scope. Bump versions
+# with `npm run sync-versions` (in promptsign-napi) before tagging.
+name: publish @promptsign/verify
+
+on:
+  push:
+    tags: ['verify-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64-gnu
+            linker: gcc-aarch64-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x64-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform: linux-arm64-musl
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install cross linker
+        if: matrix.linker != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.linker }}
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # musl targets build in a container via `cross` (bundles the musl
+      # toolchains for both x64 and arm64); everything else uses plain cargo.
+      - name: install cross
+        if: ${{ matrix.cross }}
+        run: cargo install cross --locked
+
+      - name: build addon (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release -p promptsign-napi --target ${{ matrix.target }} --manifest-path Cargo.toml
+
+      - name: build addon (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release -p promptsign-napi --target ${{ matrix.target }} --manifest-path Cargo.toml
+
+      - name: stage into npm dir
+        run: node promptsign-napi/scripts/stage-platform.mjs ${{ matrix.target }} ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.platform }}
+          path: promptsign-napi/npm/${{ matrix.platform }}/promptsign-napi.node
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: download prebuilt binaries
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: place binaries into npm dirs
+        working-directory: promptsign-napi
+        run: |
+          for p in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64 win32-x64-msvc; do
+            cp "$GITHUB_WORKSPACE/artifacts/$p/promptsign-napi.node" "npm/$p/promptsign-napi.node"
+          done
+
+      - name: publish platform packages
+        working-directory: promptsign-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for p in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64 win32-x64-msvc; do
+            npm publish "npm/$p" --access public --provenance
+          done
+
+      - name: publish main package
+        working-directory: promptsign-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

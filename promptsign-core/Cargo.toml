@@ -1,0 +1,27 @@
+[package]
+name = "promptsign-core"
+description = "PromptSign core: canonicalization, bundle manifests, DSSE signing/verification, trust policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["signing", "sigstore", "provenance", "supply-chain", "verification"]
+categories = ["cryptography", "development-tools"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+unicode-normalization.workspace = true
+# keyless verification (still fully offline: parse/verify stapled certs + log proofs)
+x509-cert = { version = "0.2", features = ["pem"] }
+der = "0.7"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+
+[dev-dependencies]
+x509-cert = { version = "0.2", features = ["pem", "builder"] }

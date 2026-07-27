@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+**/target/
+
+# napi native addon: local dev build (copy-artifact.mjs) and CI-staged platform
+# binaries. Rebuilt fresh by the publish workflow; also covered by
+# promptsign-napi/.gitignore.
+*.node
+
+# Node deps for the napi package's JS glue / tests
+node_modules/
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Cargo.lock IS committed (reproducible builds) — do not ignore it.

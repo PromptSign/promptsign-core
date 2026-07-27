@@ -1,0 +1,29 @@
+{
+  "name": "@promptsign/verify",
+  "version": "0.2.0",
+  "description": "Embed the PromptSign verifier — the same audited Rust core as the CLI — in Node. Verify-only.",
+  "license": "Apache-2.0",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "files": [
+    "index.cjs",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "build": "cargo build --release -p promptsign-napi --manifest-path ../Cargo.toml && node scripts/copy-artifact.mjs",
+    "sync-versions": "node scripts/sync-versions.mjs",
+    "test": "node --test"
+  },
+  "optionalDependencies": {
+    "@promptsign/verify-linux-x64-gnu": "0.2.0",
+    "@promptsign/verify-linux-arm64-gnu": "0.2.0",
+    "@promptsign/verify-linux-x64-musl": "0.2.0",
+    "@promptsign/verify-linux-arm64-musl": "0.2.0",
+    "@promptsign/verify-darwin-x64": "0.2.0",
+    "@promptsign/verify-darwin-arm64": "0.2.0",
+    "@promptsign/verify-win32-x64-msvc": "0.2.0"
+  }
+}

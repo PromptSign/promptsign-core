@@ -1,0 +1,22 @@
+{
+  "name": "@promptsign/verify-linux-x64-gnu",
+  "version": "0.2.0",
+  "description": "Prebuilt PromptSign verifier native addon for linux-x64 (glibc). Installed automatically by @promptsign/verify.",
+  "license": "Apache-2.0",
+  "main": "promptsign-napi.node",
+  "files": [
+    "promptsign-napi.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
