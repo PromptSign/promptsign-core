@@ -1,0 +1,19 @@
+{
+  "name": "@promptsign/verify-darwin-arm64",
+  "version": "0.2.0",
+  "description": "Prebuilt PromptSign verifier native addon for macOS arm64 (Apple Silicon). Installed automatically by @promptsign/verify.",
+  "license": "Apache-2.0",
+  "main": "promptsign-napi.node",
+  "files": [
+    "promptsign-napi.node"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

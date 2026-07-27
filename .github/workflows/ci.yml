@@ -1,0 +1,82 @@
+# Build and test the verifier core on every platform it ships to.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # promptsign-napi's build script wants a Node toolchain present.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test --workspace --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # The napi binding's JS surface (published index.cjs, its test, and the build
+  # helper scripts) has no other Node tooling, so prettier runs straight from a
+  # pinned npx — no devDependency, no lockfile to keep in step.
+  format:
+    name: prettier (js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - run: npx prettier@3.9.6 --check "promptsign-napi/**/*.{mjs,cjs,ts}"
+
+  # The verifier core is a trust root: need a clean supply-chain.
+  # Fail the build on a known-vulnerable or unmaintained dependency.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

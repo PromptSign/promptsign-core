@@ -1,0 +1,19 @@
+[package]
+name = "promptsign-napi"
+description = "Node (napi-rs) binding for the PromptSign verifier — wraps promptsign-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Wrap the SAME audited core the CLI uses — verification, never signing.
+promptsign-core = { path = "../promptsign-core" }
+serde_json.workspace = true
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

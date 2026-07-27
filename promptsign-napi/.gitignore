@@ -1,0 +1,3 @@
+# Local dev build (copy-artifact.mjs) and CI-staged platform binaries.
+promptsign-napi.node
+npm/*/promptsign-napi.node

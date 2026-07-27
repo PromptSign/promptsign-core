@@ -1,0 +1,22 @@
+{
+  "name": "@promptsign/verify-linux-arm64-musl",
+  "version": "0.2.0",
+  "description": "Prebuilt PromptSign verifier native addon for linux-arm64 (musl, e.g. Alpine). Installed automatically by @promptsign/verify.",
+  "license": "Apache-2.0",
+  "main": "promptsign-napi.node",
+  "files": [
+    "promptsign-napi.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

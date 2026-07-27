@@ -1,0 +1,19 @@
+{
+  "name": "@promptsign/verify-win32-x64-msvc",
+  "version": "0.2.0",
+  "description": "Prebuilt PromptSign verifier native addon for Windows x64 (MSVC). Installed automatically by @promptsign/verify.",
+  "license": "Apache-2.0",
+  "main": "promptsign-napi.node",
+  "files": [
+    "promptsign-napi.node"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
