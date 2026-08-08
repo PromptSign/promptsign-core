@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,16 +15,22 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const napi = require('../index.cjs');
 const here = path.dirname(fileURLToPath(import.meta.url));
-const RUST_BIN =
-  process.env.PROMPTSIGN_RUST_BIN ||
-  path.resolve(
-    here,
-    '..',
-    '..',
-    'target',
-    'debug',
-    process.platform === 'win32' ? 'promptsign.exe' : 'promptsign',
-  );
+// The CLI is a sibling repo, so its target dir is the likelier location — but a
+// workspace that has both checked out one level up also works. Absent entirely,
+// the parity tests skip: they compare against the CLI, and a missing CLI is a
+// missing comparison, not a failure of the binding.
+const exe = process.platform === 'win32' ? 'promptsign.exe' : 'promptsign';
+const RUST_BIN = [
+  process.env.PROMPTSIGN_RUST_BIN,
+  path.resolve(here, '..', '..', '..', 'promptsign-cli', 'target', 'debug', exe),
+  path.resolve(here, '..', '..', 'target', 'debug', exe),
+].find((p) => p && existsSync(p));
+
+const parity = RUST_BIN
+  ? false
+  : 'no promptsign CLI with the local-key feature — build one with ' +
+    '`cargo build --features local-key -p promptsign-cli` in the promptsign-cli repo, ' +
+    'or set PROMPTSIGN_RUST_BIN';
 
 // The CLI exits 2 when verification fails; its JSON still goes to stdout. Read it
 // regardless of exit code so we can compare a failing verdict too.
@@ -71,7 +77,7 @@ function napiVerify(fn, home, cwd) {
   }
 }
 
-test('verify() equals `promptsign verify --json` byte-for-byte', () => {
+test('verify() equals `promptsign verify --json` byte-for-byte', { skip: parity }, () => {
   const { work, home, skill, env } = signedSkill('ok');
   const cli = cliJson(['verify', skill, '--json', '--no-pin-updates'], { env, cwd: work });
   const got = napiVerify(() => napi.verify(skill, { noPinUpdates: true }), home, work);
@@ -81,7 +87,7 @@ test('verify() equals `promptsign verify --json` byte-for-byte', () => {
   assert.equal(got.name, 'demo/napi');
 });
 
-test('verify() reports a tampered file as failed, same as the CLI', () => {
+test('verify() reports a tampered file as failed, same as the CLI', { skip: parity }, () => {
   const { work, home, skill, env } = signedSkill('tamper');
   writeFileSync(path.join(skill, 'scripts', 'run.py'), 'print(2)\n'); // change after signing
   const cli = cliJson(['verify', skill, '--json', '--no-pin-updates'], { env, cwd: work });
@@ -91,7 +97,7 @@ test('verify() reports a tampered file as failed, same as the CLI', () => {
   assert.ok(got.findings.some((f) => /modified/.test(f.message)));
 });
 
-test('verifyTree() returns an array matching verify-tree --json', () => {
+test('verifyTree() returns an array matching verify-tree --json', { skip: parity }, () => {
   const { work, home, skill, env } = signedSkill('tree');
   const cli = cliJson(['verify-tree', skill, '--json', '--no-pin-updates'], { env, cwd: work });
   const got = napiVerify(() => napi.verifyTree([skill], { noPinUpdates: true }), home, work);
@@ -99,12 +105,16 @@ test('verifyTree() returns an array matching verify-tree --json', () => {
   assert.equal(got.length, cli.length);
 });
 
-test('policyShow() returns the built-in default when no policy is configured', () => {
-  const { work, home } = signedSkill('policy');
-  const got = napiVerify(() => napi.policyShow(work), home, work);
-  assert.equal(got.schema, 'promptsign/policy/v1');
-  assert.ok(Array.isArray(got.rules));
-});
+test(
+  'policyShow() returns the built-in default when no policy is configured',
+  { skip: parity },
+  () => {
+    const { work, home } = signedSkill('policy');
+    const got = napiVerify(() => napi.policyShow(work), home, work);
+    assert.equal(got.schema, 'promptsign/policy/v1');
+    assert.ok(Array.isArray(got.rules));
+  },
+);
 
 test('coreVersion() reports the wrapped core version', () => {
   assert.match(napi.coreVersion(), /^\d+\.\d+\.\d+/);

@@ -55,6 +55,37 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # `cargo test` covers the Rust core but never loads the addon, so the binding's
+  # own behaviour — platform resolution, the pinned trust root, and the Rekor log
+  # id it is pinned to — went unchecked. This job builds the addon and runs the
+  # Node tests against it. The parity tests skip here (they need a CLI built with
+  # the local-key feature, which lives in a sibling repo); run them locally with
+  # PROMPTSIGN_RUST_BIN before a release.
+  napi:
+    name: napi (node)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release -p promptsign-napi --locked
+
+      - run: node promptsign-napi/scripts/copy-artifact.mjs
+
+      - run: node --test
+        working-directory: promptsign-napi
+
   # The napi binding's JS surface (published index.cjs, its test, and the build
   # helper scripts) has no other Node tooling, so prettier runs straight from a
   # pinned npx — no devDependency, no lockfile to keep in step.

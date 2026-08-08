@@ -52,3 +52,26 @@ export function policyShow(dir: string): unknown;
 
 /** The wrapped promptsign-core version. */
 export function coreVersion(): string;
+
+export interface TrustRootInfo {
+  /** Directory holding fulcio.pem and rekor.pub. */
+  dir: string;
+  /**
+   * Why that directory: an explicit `PROMPTSIGN_TRUST_DIR`, a `PROMPTSIGN_HOME`
+   * that takes precedence over the package's own copy, the root `bundled` with
+   * this package, or the core's default location under the user's home.
+   */
+  source: 'PROMPTSIGN_TRUST_DIR' | 'PROMPTSIGN_HOME' | 'bundled' | 'promptsign-home-default';
+}
+
+/**
+ * The Sigstore trust root keyless verification will use, and why.
+ *
+ * This package pins its own copy in `trust/`, so verification works offline on a
+ * machine that has never run `promptsign trust fetch`. On the first call to
+ * `verify`, `verifyTree` or `verifyKeyless` that copy is selected by setting
+ * `process.env.PROMPTSIGN_TRUST_DIR` — the core reads the directory from the
+ * environment. A `PROMPTSIGN_TRUST_DIR` or `PROMPTSIGN_HOME` the host already
+ * set is never overridden, so an operator's own (or private) root wins.
+ */
+export function trustRoot(): TrustRootInfo;
