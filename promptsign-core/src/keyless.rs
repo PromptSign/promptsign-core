@@ -31,10 +31,23 @@ const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.84
 const OID_P256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
 const OID_P384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
 
+/// One transparency log: its public key, and the log id (hex SHA-256 of the
+/// key's SPKI DER) that every entry it witnesses carries.
+pub struct RekorLog {
+    pub key: p256::ecdsa::VerifyingKey,
+    pub log_id: String,
+}
+
 pub struct TrustRoot {
     pub ca_certs: Vec<Certificate>,
-    pub rekor_key: p256::ecdsa::VerifyingKey,
-    pub rekor_log_id: String,
+    /// Every log whose entries are accepted, in file order — first is current.
+    ///
+    /// Plural for the same reason `ca_certs` is: rotation must not invalidate
+    /// what was already witnessed. An entry names the log that recorded it, so
+    /// verification selects by that name; a signature made before a key rotation
+    /// keeps verifying against the retired key. A single-key `rekor.pub` is just
+    /// the one-element case, so nothing has to change until Sigstore rotates.
+    pub rekor_logs: Vec<RekorLog>,
 }
 
 pub fn trust_dir() -> PathBuf {
@@ -65,37 +78,60 @@ pub fn load_trust_root() -> Result<TrustRoot> {
     }
 
     let rekor_pem = fs::read_to_string(&rekor).map_err(|e| format!("{}: {e}", rekor.display()))?;
-    let (rekor_key, spki_der) =
-        parse_p256_spki_pem(&rekor_pem).map_err(|e| format!("{}: {e}", rekor.display()))?;
+    let rekor_logs =
+        parse_rekor_logs(&rekor_pem).map_err(|e| format!("{}: {e}", rekor.display()))?;
 
     Ok(TrustRoot {
         ca_certs,
-        rekor_key,
-        rekor_log_id: sha256_hex(&spki_der),
+        rekor_logs,
     })
 }
 
-fn parse_p256_spki_pem(pem: &str) -> Result<(p256::ecdsa::VerifyingKey, Vec<u8>)> {
-    let der = pem_body(pem, "PUBLIC KEY")?;
-    let key = p256::ecdsa::VerifyingKey::from_public_key_der(&der)
-        .map_err(|e| format!("invalid P-256 public key: {e}"))?;
+/// Every trusted log in a `rekor.pub`, one PEM PUBLIC KEY block each. The file
+/// is append-only by convention: adding a rotated key must not remove the key
+/// that witnessed everything signed before it.
+fn parse_rekor_logs(pem: &str) -> Result<Vec<RekorLog>> {
+    let ders = pem_bodies(pem, "PUBLIC KEY")?;
 
-    Ok((key, der))
+    if ders.is_empty() {
+        return Err("no PUBLIC KEY block".to_string());
+    }
+
+    ders.into_iter()
+        .map(|der| {
+            let key = p256::ecdsa::VerifyingKey::from_public_key_der(&der)
+                .map_err(|e| format!("invalid P-256 public key: {e}"))?;
+
+            Ok(RekorLog {
+                key,
+                log_id: sha256_hex(&der),
+            })
+        })
+        .collect()
 }
 
-fn pem_body(pem: &str, label: &str) -> Result<Vec<u8>> {
+fn pem_bodies(pem: &str, label: &str) -> Result<Vec<Vec<u8>>> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
-    let start = pem.find(&begin).ok_or(format!("missing {begin}"))? + begin.len();
-    let stop = pem.find(&end).ok_or(format!("missing {end}"))?;
-    let b64: String = pem[start..stop]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let mut out = Vec::new();
+    let mut rest = pem;
 
-    BASE64_STANDARD
-        .decode(&b64)
-        .map_err(|e| format!("invalid PEM base64: {e}"))
+    while let Some(start) = rest.find(&begin) {
+        let after = &rest[start + begin.len()..];
+        let stop = after.find(&end).ok_or(format!("missing {end}"))?;
+        let b64: String = after[..stop]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        out.push(
+            BASE64_STANDARD
+                .decode(&b64)
+                .map_err(|e| format!("invalid PEM base64: {e}"))?,
+        );
+        rest = &after[stop + end.len()..];
+    }
+    Ok(out)
 }
 
 fn spki_der_of(cert: &Certificate) -> Result<Vec<u8>> {
@@ -343,11 +379,25 @@ pub fn verify_keyless(bundle: &Value) -> Result<KeylessVerification> {
     let set_b64 =
         str_at(t, &["signedEntryTimestamp"]).ok_or("transparency.signedEntryTimestamp missing")?;
 
-    if log_id != trust.rekor_log_id {
-        return Err(format!(
-            "transparency logId {log_id} does not match trusted log"
-        ));
-    }
+    // The entry names the log that witnessed it; pick that log's key rather than
+    // assuming one. After a key rotation both the retired and the current log are
+    // pinned, so old entries verify against the key that actually signed them.
+    let log = trust
+        .rekor_logs
+        .iter()
+        .find(|l| l.log_id == log_id)
+        .ok_or_else(|| {
+            let trusted: Vec<&str> = trust
+                .rekor_logs
+                .iter()
+                .map(|l| &l.log_id[..16.min(l.log_id.len())])
+                .collect();
+
+            format!(
+                "transparency logId {log_id} does not match any trusted log (trusted: {}…)",
+                trusted.join("…, ")
+            )
+        })?;
 
     let canonical = format!(
         "{{\"body\":{},\"integratedTime\":{integrated_time},\"logID\":{},\"logIndex\":{log_index}}}",
@@ -359,8 +409,7 @@ pub fn verify_keyless(bundle: &Value) -> Result<KeylessVerification> {
         .map_err(|_| "invalid base64 in signedEntryTimestamp")?;
     let set_sig = p256::ecdsa::Signature::from_der(&set).map_err(|_| "malformed SET")?;
 
-    trust
-        .rekor_key
+    log.key
         .verify_prehash(&Sha256::digest(canonical.as_bytes()), &set_sig)
         .map_err(|_| "signed entry timestamp verification failed".to_string())?;
 
@@ -462,9 +511,23 @@ pub fn chain_leaf_info(chain_b64: &[String]) -> Result<(String, String, String)>
     Ok((identity, issuer, sha256_hex(&spki_der_of(&leaf)?)))
 }
 
-/// The trusted log's id (hex SHA-256 of its public key SPKI DER), for display.
+/// Every trusted log's id (hex SHA-256 of its public key SPKI DER), for display.
+/// First is the current log; any others are retired keys still being honoured.
+pub fn trusted_log_ids() -> Result<Vec<String>> {
+    Ok(load_trust_root()?
+        .rekor_logs
+        .into_iter()
+        .map(|l| l.log_id)
+        .collect())
+}
+
+/// The current log's id. Callers that show every pinned log want
+/// [`trusted_log_ids`].
 pub fn trusted_log_id() -> Result<String> {
-    Ok(load_trust_root()?.rekor_log_id)
+    trusted_log_ids()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no trusted Rekor log".to_string())
 }
 
 fn show_str(v: &Value, key: &str) -> String {

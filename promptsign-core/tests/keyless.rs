@@ -307,6 +307,60 @@ fn keyless_verify_end_to_end() {
         .unwrap_err()
         .contains("does not terminate at a trusted root"));
 
+    // --- Rekor key rotation ---
+    // Retiring a log key must not invalidate what that log already witnessed.
+    // rekor.pub holds one PEM block per trusted log, current first; an entry
+    // names the log that recorded it and is checked against that log's key.
+    let rotated_key = p256::ecdsa::SigningKey::from_slice(&[46u8; 32]).unwrap();
+    let rotated_spki_der = rotated_key.verifying_key().to_public_key_der().unwrap();
+    let rotated_log_id = sha256_hex(rotated_spki_der.as_bytes());
+
+    std::fs::write(
+        trust.join("rekor.pub"),
+        format!(
+            "{}{}",
+            rotated_key
+                .verifying_key()
+                .to_public_key_pem(Default::default())
+                .unwrap(),
+            rekor_key
+                .verifying_key()
+                .to_public_key_pem(Default::default())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    // the entry witnessed before the rotation still verifies, against the
+    // retired key — this is the regression the plural form exists to prevent
+    verify_envelope(&bundle).expect("entry witnessed before rotation must still verify");
+
+    // and an entry from the new log verifies too
+    let rotated_canonical = format!(
+        "{{\"body\":{},\"integratedTime\":{integrated_time},\"logID\":{},\"logIndex\":43}}",
+        serde_json::to_string(&body_b64).unwrap(),
+        serde_json::to_string(&rotated_log_id).unwrap()
+    );
+    let rotated_set: p256::ecdsa::Signature = rotated_key
+        .sign_prehash(&Sha256::digest(rotated_canonical.as_bytes()))
+        .unwrap();
+    let mut rotated_bundle = bundle.clone();
+
+    rotated_bundle["transparency"]["logId"] = json!(rotated_log_id);
+    rotated_bundle["transparency"]["logIndex"] = json!(43);
+    rotated_bundle["transparency"]["signedEntryTimestamp"] =
+        json!(BASE64_STANDARD.encode(rotated_set.to_der()));
+    verify_envelope(&rotated_bundle).expect("entry from the rotated log must verify");
+
+    // an entry naming a log we do not pin is still rejected — the lookup happens
+    // before the SET check, so this is the log-selection error, not a bad signature
+    let mut untrusted = rotated_bundle.clone();
+
+    untrusted["transparency"]["logId"] = json!(sha256_hex(b"not a log we trust"));
+    assert!(verify_envelope(&untrusted)
+        .unwrap_err()
+        .contains("does not match any trusted log"));
+
     std::env::remove_var("PROMPTSIGN_TRUST_DIR");
 
     let _ = std::fs::remove_dir_all(&trust);

@@ -22,10 +22,23 @@ const pkg = path.resolve(here, '..');
 const TRUST_DIR = path.join(pkg, 'trust');
 const built = fs.existsSync(path.join(pkg, 'promptsign-napi.node'));
 
-// The Rekor log this package trusts. A change to trust/rekor.pub is a
-// security-relevant change: it must be deliberate, and it must update this
-// constant in the same commit.
+// The Rekor log this package trusts. rekor.pub holds one PEM block per trusted
+// log and is append-only: a rotation adds the new key and keeps the old one, so
+// entries witnessed before the rotation stay verifiable. Appending is therefore
+// allowed here; dropping this log is not, and fails until the constant changes
+// in the same commit.
 const REKOR_LOG_ID = 'c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d';
+
+/** Every log id in a rekor.pub, computed the way the core does: sha256 of each
+ *  block's SPKI DER. */
+function logIds(pem) {
+  return [...pem.matchAll(/-----BEGIN PUBLIC KEY-----([\s\S]*?)-----END PUBLIC KEY-----/g)].map(
+    (m) =>
+      createHash('sha256')
+        .update(Buffer.from(m[1].replace(/\s+/g, ''), 'base64'))
+        .digest('hex'),
+  );
+}
 
 // Structurally a keyless bundle, with a certificate chain that is not a
 // certificate. Loading the trust root happens *before* the chain is parsed, so
@@ -68,16 +81,14 @@ describe('the pinned trust root', () => {
     );
   });
 
-  test('is the Rekor log we expect', () => {
-    // Same computation as the core: sha256 of the key's SPKI DER.
-    const der = Buffer.from(
-      fs
-        .readFileSync(path.join(TRUST_DIR, 'rekor.pub'), 'utf8')
-        .replace(/-----[^-]+-----/g, '')
-        .replace(/\s+/g, ''),
-      'base64',
+  test('still trusts the Rekor log we pin', () => {
+    const ids = logIds(fs.readFileSync(path.join(TRUST_DIR, 'rekor.pub'), 'utf8'));
+    assert.ok(ids.length > 0, 'rekor.pub has no PUBLIC KEY block');
+    assert.ok(
+      ids.includes(REKOR_LOG_ID),
+      `rekor.pub no longer trusts ${REKOR_LOG_ID}. Rotation appends a key, it does not ` +
+        `replace one — dropping a log breaks every signature it witnessed. Found: ${ids.join(', ')}`,
     );
-    assert.equal(createHash('sha256').update(der).digest('hex'), REKOR_LOG_ID);
   });
 
   test('fulcio.pem is a certificate chain, not an empty or stray file', () => {

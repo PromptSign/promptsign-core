@@ -72,17 +72,26 @@ Mechanically, the bundled root is selected by setting `PROMPTSIGN_TRUST_DIR` on
 the first `verify` / `verifyTree` / `verifyKeyless` call, since the core reads the
 directory from the environment. Importing the package changes nothing.
 
-**Rotating it.** Sigstore rotates these rarely, but it does. Refresh with:
+**Rotating it.** Sigstore rotates these rarely, but it does. Rotation is
+**append, never replace**. Both files hold a list: `fulcio.pem` contains a chain of CA
+certificates, while `rekor.pub` contains one PEM block per trusted log. A signature is
+checked against the CA that issued its certificate and the log that witnessed its entry.
+Each is selected by name, so keeping the retired material is what lets everything
+signed before the rotation continue to verify. Dropping it silently invalidates the
+entire back catalogue.
 
 ```sh
-promptsign trust fetch
-cp ~/.promptsign/trust/fulcio.pem ~/.promptsign/trust/rekor.pub promptsign-napi/trust/
-cd promptsign-napi && node --test test/trust-root.test.mjs   # asserts the log id
+promptsign trust fetch                                    # writes the current root
+cat ~/.promptsign/trust/rekor.pub   >> promptsign-napi/trust/rekor.pub
+cat ~/.promptsign/trust/fulcio.pem  >> promptsign-napi/trust/fulcio.pem
+cd promptsign-napi && node --test test/trust-root.test.mjs
 ```
 
-That test pins the expected Rekor log id, so a changed root fails until the
-constant is updated in the same commit. Treat it as a security-relevant change:
-its own commit, the new log id in the message, and a version bump.
+New material goes first if you want it listed as current; otherwise, order is 
+cosmetic, because selection is by log id and by issuer. The test asserts the
+already-pinned log is still present, so appending passes and replacing fails.
+Treat it as a security-relevant change: give it its own commit, include the
+new log ID in the commit message, and bump the version.
 
 ## Building the native addon
 
