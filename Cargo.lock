@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "promptsign-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "der",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "promptsign-napi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "napi",
  "napi-build",
