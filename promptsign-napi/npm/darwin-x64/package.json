@@ -3,6 +3,11 @@
   "version": "0.3.0",
   "description": "Prebuilt PromptSign verifier native addon for macOS x64 (Intel). Installed automatically by @promptsign/verify.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PromptSign/promptsign-core.git",
+    "directory": "promptsign-napi/npm/darwin-x64"
+  },
   "main": "promptsign-napi.node",
   "files": [
     "promptsign-napi.node"
