@@ -74,6 +74,11 @@ jobs:
 
       - name: build addon (cross)
         if: ${{ matrix.cross }}
+        # musl targets statically link libc by default, and a cdylib can't be
+        # produced for a statically-linked target. See Cross.toml for why
+        # this also has to be passed through to the container.
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
         run: cross build --release -p promptsign-napi --target ${{ matrix.target }} --manifest-path Cargo.toml
 
       - name: build addon (cargo)
