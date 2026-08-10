@@ -1,9 +1,10 @@
 # Build @promptsign/verify's native addon for every supported platform and
 # publish the platform packages + the main package to npm, with provenance.
 #
-# Trigger by pushing a tag like `verify-v0.2.0` (or run manually). Requires an
-# NPM_TOKEN secret with publish rights to the @promptsign scope. Bump versions
-# with `npm run sync-versions` (in promptsign-napi) before tagging.
+# Trigger by pushing a tag like `verify-v0.3.0` (or run manually). No secret is
+# needed: publishing goes through npm trusted publishing, which authenticates
+# this workflow by its OIDC identity. Bump versions with `npm run sync-versions`
+# (in promptsign-napi) before tagging.
 name: publish @promptsign/verify
 
 on:
@@ -114,17 +115,22 @@ jobs:
             cp "$GITHUB_WORKSPACE/artifacts/$p/promptsign-napi.node" "npm/$p/promptsign-napi.node"
           done
 
+      # Published through npm trusted publishing, so there is no token anywhere:
+      # the registry accepts the upload on the strength of this workflow's OIDC
+      # identity, the same shape as the keyless signing this package exists to
+      # verify. Provenance is generated automatically for a public package from
+      # a public repository, so --provenance is not passed.
+      #
+      # Each of these eight packages has its own trusted publisher configured on
+      # npmjs.com, naming this repository and this workflow file. Renaming the
+      # file breaks publishing until they are updated.
       - name: publish platform packages
         working-directory: promptsign-napi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for p in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64 win32-x64-msvc; do
-            npm publish "npm/$p" --access public --provenance
+            npm publish "npm/$p" --access public
           done
 
       - name: publish main package
         working-directory: promptsign-napi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+        run: npm publish --access public
