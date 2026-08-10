@@ -138,7 +138,9 @@ jobs:
         working-directory: promptsign-napi
         run: |
           for p in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64 win32-x64-msvc; do
-            npm publish "npm/$p" --access public
+            # use "./" to remove "owner/repo" looking path and prevent 
+            # npm-package-args thinking it's github.com/npm/linux-x64-gnu
+            npm publish "./npm/$p" --access public
           done
 
       - name: publish main package
