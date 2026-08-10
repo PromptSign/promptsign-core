@@ -38,7 +38,12 @@ jobs:
             target: aarch64-unknown-linux-musl
             platform: linux-arm64-musl
             cross: true
-          - os: macos-13
+          # Both darwin slices build on Apple silicon, the same fix applied to
+          # promptsign-cli's release workflow: macos-13 is an Intel runner
+          # image GitHub is retiring. stage-platform.mjs only copies the built
+          # .node file rather than loading it, so nothing here needs to
+          # execute a foreign-architecture binary.
+          - os: macos-14
             target: x86_64-apple-darwin
             platform: darwin-x64
           - os: macos-14
