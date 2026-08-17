@@ -1,0 +1,64 @@
+# Publish the promptsign-core crate to crates.io.
+#
+# Trigger by pushing a tag like `core-v0.3.1`. No secret is needed. crates.io
+# trusted publishing authenticates this workflow by its OIDC identity, the same
+# shape as the keyless signing this crate exists to verify. The trusted publisher
+# on crates.io names this repository and this workflow file. Renaming the file
+# breaks publishing until it is updated.
+#
+# A crates.io version is permanent. It can be yanked, but the number can never
+# be reused, so the guard below refuses to publish when the tag and the manifest
+# disagree.
+name: publish promptsign-core
+
+on:
+  push:
+    tags: ['core-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check tag against manifest version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF#refs/tags/core-v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "promptsign-core") | .version')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag core-v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+      # The workspace as a whole is covered by ci.yml on every push to main. This
+      # runs the core's own tests again at the moment of release, because the
+      # upload cannot be taken back.
+      - run: cargo test -p promptsign-core --locked
+
+      - name: authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # cargo publish rebuilds the packaged crate from a clean copy before
+      # uploading, which catches a file that the package excludes but the build
+      # needs. The token this step consumes is revoked when the job ends.
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p promptsign-core --locked

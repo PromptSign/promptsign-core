@@ -4,6 +4,9 @@ description = "Node (napi-rs) binding for the PromptSign verifier — wraps prom
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# This binding ships to npm as a prebuilt addon, never to crates.io. The flag
+# keeps a bare `cargo publish` in the workspace root from trying to upload it.
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
