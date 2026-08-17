@@ -108,7 +108,16 @@ pub fn role_for(rel_path: &str) -> &'static str {
     "reference"
 }
 
-fn walk(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
+/// A bundle directory as the walker sees it. Symlinks are kept apart from
+/// regular files because the two callers want opposite things from them.
+/// Signing refuses to sign a link, and verification reports one as an
+/// intrusion.
+pub struct Tree {
+    pub files: Vec<String>,
+    pub links: Vec<String>,
+}
+
+fn walk(root: &Path, rel: &str, out: &mut Tree) -> Result<()> {
     let abs = if rel.is_empty() {
         root.to_path_buf()
     } else {
@@ -126,6 +135,18 @@ fn walk(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
         };
         let ftype = ent.file_type().map_err(|e| format!("{rel_child}: {e}"))?;
 
+        // file_type() reports the entry itself and never follows a link, so a
+        // symlink satisfies neither is_dir() nor is_file(). Recording it here is
+        // what stops a link from falling through both arms unseen. A link that
+        // no one records is a link that check_integrity cannot report, which
+        // would let an entire attacker-controlled directory be grafted into a
+        // signed bundle while the bundle still verified as intact. On Windows
+        // this arm also catches directory junctions, which are the cheaper
+        // attack because creating one needs no privilege.
+        if ftype.is_symlink() {
+            out.links.push(rel_child);
+            continue;
+        }
         if ftype.is_dir() {
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
@@ -135,18 +156,26 @@ fn walk(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
             if is_sidecar(&name) {
                 continue;
             }
-            out.push(rel_child);
+            out.files.push(rel_child);
         }
     }
     Ok(())
 }
 
-pub fn walk_files(root: &Path) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+pub fn walk_tree(root: &Path) -> Result<Tree> {
+    let mut out = Tree {
+        files: Vec::new(),
+        links: Vec::new(),
+    };
 
     walk(root, "", &mut out)?;
-    out.sort();
+    out.files.sort();
+    out.links.sort();
     Ok(out)
+}
+
+pub fn walk_files(root: &Path) -> Result<Vec<String>> {
+    Ok(walk_tree(root)?.files)
 }
 
 // Best-effort read of a top-level `name:` / `version:` from a markdown file's
@@ -253,12 +282,22 @@ pub fn build_manifest(
             (vec![base], "file")
         }
         None => {
-            let paths = walk_files(root)?;
+            let tree = walk_tree(root)?;
 
-            if paths.is_empty() {
+            // Refused rather than followed. Hashing through a link would put the
+            // signed bytes outside the bundle, where the publisher does not
+            // control them and a later swap of the target changes what the host
+            // loads. A manifest entry has to name a file the bundle actually
+            // contains.
+            if let Some(link) = tree.links.first() {
+                return Err(format!(
+                    "refusing to sign symlink: {link} (a bundle must contain only regular files)"
+                ));
+            }
+            if tree.files.is_empty() {
                 return Err(format!("no files to sign under {}", root.display()));
             }
-            (paths, "dir")
+            (tree.files, "dir")
         }
     };
     let mut files = Vec::with_capacity(rel_paths.len());
@@ -371,11 +410,19 @@ pub fn check_integrity(root: &Path, manifest: &Manifest) -> Result<Vec<String>> 
     if manifest.scope.as_deref() != Some("file") {
         let listed: std::collections::HashSet<&str> =
             manifest.files.iter().map(|f| f.path.as_str()).collect();
+        let tree = walk_tree(root)?;
 
-        for on_disk in walk_files(root)? {
+        for on_disk in tree.files {
             if !listed.contains(on_disk.as_str()) {
                 problems.push(format!("unlisted file present: {on_disk}"));
             }
+        }
+        // Always a failure, whether or not the manifest happens to list the same
+        // path. Signing never produces a link, so one in a verified tree was
+        // added afterwards, and a link to a directory grafts in a whole subtree
+        // that this walk deliberately did not descend into.
+        for link in tree.links {
+            problems.push(format!("symlink present: {link}"));
         }
     }
     Ok(problems)
@@ -498,5 +545,56 @@ mod tests {
         assert_eq!(strip_md_ext("REVIEWER.MD"), "REVIEWER");
         assert_eq!(strip_md_ext("notes.markdown"), "notes");
         assert_eq!(strip_md_ext("script.py"), "script.py");
+    }
+
+    // A symlink grafts whatever it points at into the bundle without the walk
+    // ever descending into it. Before these two behaviours existed the link was
+    // invisible to both sides: nothing listed it, so nothing could report it as
+    // unlisted, and a whole attacker-controlled directory could sit inside a
+    // bundle that still verified as intact. The Windows equivalent is a
+    // directory junction, which needs no privilege to create, but std has no
+    // portable way to make one, so the test runs on unix only.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_refused_on_sign_and_reported_on_verify() {
+        let dir = std::env::temp_dir().join("ps_symlink_bundle");
+        let outside = std::env::temp_dir().join("ps_symlink_outside");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(dir.join("SKILL.md"), "# skill\n").unwrap();
+        fs::write(outside.join("run.sh"), "echo grafted\n").unwrap();
+
+        let opts = BuildOptions {
+            name: Some("t"),
+            version: Some("1.0.0"),
+            kind: Some("skill"),
+        };
+        let manifest = build_manifest(&dir, None, &opts).unwrap();
+
+        assert_eq!(manifest.files.len(), 1);
+        assert!(check_integrity(&dir, &manifest).unwrap().is_empty());
+
+        std::os::unix::fs::symlink(&outside, dir.join("scripts")).unwrap();
+
+        // The grafted file is genuinely reachable through the bundle.
+        assert!(dir.join("scripts/run.sh").exists());
+
+        let problems = check_integrity(&dir, &manifest).unwrap();
+
+        assert!(
+            problems.iter().any(|p| p == "symlink present: scripts"),
+            "verify must report the graft, got {problems:?}"
+        );
+
+        // Signing the same tree now refuses rather than hashing through the link.
+        let err = build_manifest(&dir, None, &opts).unwrap_err();
+
+        assert!(err.contains("refusing to sign symlink"), "got {err}");
+
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 }
