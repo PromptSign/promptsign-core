@@ -1,0 +1,93 @@
+# Notice when Sigstore rotates its trust root.
+#
+# Nothing else does. The pinned Rekor log id in promptsign-napi's test catches a
+# bad local edit, and the drift job in ci.yml catches a copy falling out of step
+# with trust/, but neither ever looks upstream. Without this, a rotation could go
+# unnoticed for months.
+#
+# This never commits to main, and that restriction is the point.
+#
+# A pin is worth something only because it does not change when a server says
+# so. A job that fetched the root and committed it would make trust/fulcio.pem
+# mean "the last thing the endpoint returned", which is a cache rather than a
+# pin. Reaching that endpoint means trusting DNS, the public CA system, and
+# Sigstore's own infrastructure, so anyone who subverts one of those would get
+# their CA appended on a schedule with nobody looking, and every signature they
+# then issued would verify.
+#
+# These endpoints return bare PEM with no version, no expiry, and no signature
+# over the response, so a genuine rotation, a replay of an old answer, and an
+# injected one are indistinguishable here. That is what the TUF trusted_root.json
+# migration fixes, because its metadata is signed and versioned.
+#
+# The asymmetry decides it. Being slow to accept a real rotation costs some
+# signatures that do not verify until a human merges. Being quick to accept a
+# forged one is silent and unrecoverable.
+#
+# Deliberately not part of ci.yml. Running this on every pull request would make
+# the repository's CI exactly as available as sigstore.dev, and a rotation is not
+# something that needs checking on a per-commit basis.
+name: watch trust root
+
+on:
+  schedule:
+    # Weekly, Monday morning UTC. Off the hour, because GitHub queues scheduled
+    # runs at :00 and drops them under load.
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    name: compare the pinned root against Sigstore
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the branch holding the appended material
+      pull-requests: write # open or update the review request
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Exits non-zero only when Sigstore could not be reached, in which case
+      # nothing was compared and there is nothing to review. Drift is reported
+      # through the step output instead, so that this failure mode and a real
+      # rotation cannot be confused for one another.
+      - id: watch
+        run: node scripts/watch-trust-root.mjs
+
+      # gh is preinstalled on the runner, so this needs no third-party action.
+      # For a repository whose whole job is being a trust root, every action
+      # added here is another thing that has to be trusted to sign releases.
+      - name: open or update the review request
+        if: steps.watch.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch=trust-root/upstream
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+
+          # Only the trust material. The generated body file stays untracked.
+          git add trust promptsign-napi/trust
+          git commit -m 'Append rotated Sigstore trust material'
+
+          # Force, because an unreviewed request from a previous week is
+          # replaced by the current state rather than stacked on top of.
+          git push --force origin "$branch"
+
+          if [ -n "$(gh pr list --head "$branch" --state open --json number -q '.[0].number')" ]; then
+            gh pr edit "$branch" --body-file trust-root-pr-body.md
+            echo "updated the open request on $branch"
+          else
+            gh pr create --head "$branch" --base main \
+              --title 'Trust root: Sigstore is serving material this repository does not pin' \
+              --body-file trust-root-pr-body.md
+          fi

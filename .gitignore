@@ -11,6 +11,10 @@
 node_modules/
 npm-debug.log*
 
+# Pull request body written by scripts/watch-trust-root.mjs. It describes the
+# commit rather than belonging to it, so it must never land in the tree.
+/trust-root-pr-body.md
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

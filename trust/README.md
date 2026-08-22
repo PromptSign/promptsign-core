@@ -29,6 +29,35 @@ is a package that installs cleanly and then fails at verification time on
 someone else's machine. A committed copy that drifts fails in CI instead, on the
 pull request that caused it.
 
+## Noticing a rotation
+
+`scripts/watch-trust-root.mjs` compares what this directory pins against what
+Sigstore currently serves, weekly and on demand, through
+`.github/workflows/watch-trust-root.yml`.
+
+The comparison is of sets rather than of bytes, and that difference matters. The
+two endpoints serve only what is current, while this root accumulates. After the
+first rotation the two are permanently unequal byte for byte, and that is
+correct. The question the watcher asks is narrower: does Sigstore serve anything
+this root does not already cover?
+
+When the answer is yes it appends the new blocks, syncs the copies, and opens a
+pull request whose body lists the identifiers rather than the base64.
+
+It never commits to `main`. A pin is worth something only because it does not
+change when a server says so, and a job that committed what it fetched would
+make these files mean "the last thing the endpoint returned". Reaching that
+endpoint means trusting DNS, the public CA system, and Sigstore's own
+infrastructure. Anyone who subverted one of those would get their CA appended on
+a schedule with nobody looking, and every signature they issued afterwards would
+verify. The endpoints also return bare PEM with no version, no expiry, and no
+signature over the response, so a real rotation and a replayed or injected one
+look the same from here. A human reviews instead.
+
+Run it yourself with `node scripts/watch-trust-root.mjs --check`, which reports
+without writing anything. Exit codes are `0` covered, `1` Sigstore unreachable,
+`2` upstream has material this root does not pin.
+
 ## Rotating the root
 
 Sigstore rotates these rarely, but it does. Rotation is **append, never
