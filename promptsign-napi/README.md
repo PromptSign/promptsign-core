@@ -41,8 +41,14 @@ honour `PROMPTSIGN_HOME`.
 
 Every keyless signature is checked against a Sigstore trust root: Fulcio's CA
 chain (`fulcio.pem`) and the Rekor log's public key (`rekor.pub`). This package
-pins its own copy in `trust/`, so `npm install` is all that is needed. 
+ships a copy in `trust/`, so `npm install` is all that is needed. 
 Verification does not require `promptsign trust fetch`, or the CLI at all.
+
+That copy is not where the root is maintained. The canonical one lives at the
+repository root, in [`trust/`](../trust/); this package carries a copy because
+npm publishes what is inside the package directory and nothing above it. The two
+are kept identical by `scripts/sync-trust.mjs`, and `test/trust-root.test.mjs`
+fails if they drift.
 
 Pinning at build time is deliberately stronger than fetching the root over TLS on
 first use, which would amount to trust-on-first-use on the trust root itself.
@@ -80,10 +86,14 @@ Each is selected by name, so keeping the retired material is what lets everythin
 signed before the rotation continue to verify. Dropping it silently invalidates the
 entire back catalogue.
 
+Append to the canonical root, never to this package's copy, then sync. Editing
+the copy in place is the one thing the drift test exists to catch.
+
 ```sh
-promptsign trust fetch                                    # writes the current root
-cat ~/.promptsign/trust/rekor.pub   >> promptsign-napi/trust/rekor.pub
-cat ~/.promptsign/trust/fulcio.pem  >> promptsign-napi/trust/fulcio.pem
+promptsign trust fetch                              # writes the current root
+cat ~/.promptsign/trust/rekor.pub  >> trust/rekor.pub
+cat ~/.promptsign/trust/fulcio.pem >> trust/fulcio.pem
+node scripts/sync-trust.mjs                         # update this package's copy
 cd promptsign-napi && node --test test/trust-root.test.mjs
 ```
 

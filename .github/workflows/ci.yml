@@ -86,6 +86,27 @@ jobs:
       - run: node --test
         working-directory: promptsign-napi
 
+  # trust/ at the repo root is the canonical pinned Sigstore trust root;
+  # promptsign-napi/trust/ is a committed copy of it, because npm publishes only
+  # what is inside the package directory. The copy is what npm consumers
+  # actually verify against, so letting it drift would anchor them to a root
+  # nobody is maintaining.
+  #
+  # trust-root.test.mjs asserts this too, but that runs in the `napi` job behind
+  # a release build on three runners. Drift is a two-file byte comparison and
+  # should fail in seconds, on its own, so the message says what to do.
+  trust:
+    name: trust root copies in step
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - run: node scripts/sync-trust.mjs --check
+
   # The napi binding's JS surface (published index.cjs, its test, and the build
   # helper scripts) has no other Node tooling, so prettier runs straight from a
   # pinned npx — no devDependency, no lockfile to keep in step.
@@ -99,7 +120,7 @@ jobs:
         with:
           node-version: 24
 
-      - run: npx prettier@3.9.6 --check "promptsign-napi/**/*.{mjs,cjs,ts}"
+      - run: npx prettier@3.9.6 --check "promptsign-napi/**/*.{mjs,cjs,ts}" "scripts/*.mjs"
 
   # The verifier core is a trust root: need a clean supply-chain.
   # Fail the build on a known-vulnerable or unmaintained dependency.

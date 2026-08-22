@@ -26,6 +26,21 @@ rather than shelling out to a binary or reimplementing verification. One
 audited core behind every surface is deliberate: a verifier *monoculture* is
 the good kind — one thing to audit, one place to fix.
 
+## Where the pinned trust root lives
+
+[`trust/`](trust/) at the repository root is the canonical, single source of
+truth for the pinned Sigstore trust root — `fulcio.pem` and `rekor.pub`. This
+repository owns it, and everything else that carries those bytes carries a copy:
+`promptsign-napi/trust/`, because npm publishes only what is inside the package
+directory, and `promptsign-plugin/trust/`, because the plugin's binary tier has
+no `node_modules` to read the npm package's copy from.
+
+Rotate the root in `trust/` and nowhere else. Rotation is **append, never
+replace** — dropping retired material invalidates every signature made under it.
+`node scripts/sync-trust.mjs` pushes a change out to the in-repo copies, and
+`promptsign-napi/test/trust-root.test.mjs` fails when a copy has drifted. See
+[`trust/README.md`](trust/README.md) for the full procedure.
+
 ## Scope
 
 **Verification — all of it, fully offline.**

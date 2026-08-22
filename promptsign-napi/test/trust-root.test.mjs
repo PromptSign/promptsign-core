@@ -1,9 +1,10 @@
 // node --test
 //
 // The trust root is what every keyless signature is ultimately checked against,
-// so two things are asserted here: that a plain `npm install` can verify with no
-// PROMPTSIGN_* configuration at all, and that the pinned root is still the root
-// we think it is.
+// so three things are asserted here: that a plain `npm install` can verify with
+// no PROMPTSIGN_* configuration at all, that the pinned root is still the root
+// we think it is, and that this package's copy of it still matches the canonical
+// one at the repo root.
 //
 // Each case runs in a child process. Selecting the bundled root sets
 // PROMPTSIGN_TRUST_DIR once per process (the core reads it from the environment),
@@ -20,6 +21,10 @@ import { describe, test } from 'node:test';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkg = path.resolve(here, '..');
 const TRUST_DIR = path.join(pkg, 'trust');
+// The canonical root, one level up. This package's trust/ is a committed copy of
+// it, kept in step by scripts/sync-trust.mjs; see trust/README.md for why the
+// copy exists at all.
+const CANONICAL_TRUST_DIR = path.resolve(pkg, '..', 'trust');
 const built = fs.existsSync(path.join(pkg, 'promptsign-napi.node'));
 
 // The Rekor log this package trusts. rekor.pub holds one PEM block per trusted
@@ -96,6 +101,29 @@ describe('the pinned trust root', () => {
     assert.match(pem, /-----BEGIN CERTIFICATE-----/);
     assert.ok(pem.length > 500, 'suspiciously small for a CA chain');
   });
+
+  // Drift is the failure this catches. The copy shipped to npm is what a JS
+  // consumer verifies against, so a copy that no longer matches the canonical
+  // root means npm users are anchored to a root nobody is maintaining. Skipped
+  // outside the repo, because the canonical directory is not published: this
+  // test file is not in package.json "files", but an installed tree is not the
+  // only place `node --test` can be pointed at.
+  test(
+    'matches the canonical root in trust/',
+    { skip: fs.existsSync(CANONICAL_TRUST_DIR) ? false : 'not a source checkout' },
+    () => {
+      for (const name of ['fulcio.pem', 'rekor.pub']) {
+        const canonical = fs.readFileSync(path.join(CANONICAL_TRUST_DIR, name));
+        const copy = fs.readFileSync(path.join(TRUST_DIR, name));
+        assert.ok(
+          canonical.equals(copy),
+          `promptsign-napi/trust/${name} has drifted from the canonical trust/${name}. ` +
+            'Append rotated material to trust/, never to this copy, then run ' +
+            '`node scripts/sync-trust.mjs` from the repo root.',
+        );
+      }
+    },
+  );
 });
 
 describe('trust root resolution', { skip: built ? false : 'native addon not built' }, () => {
