@@ -1,6 +1,6 @@
 {
   "name": "@promptsign/verify-darwin-x64",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Prebuilt PromptSign verifier native addon for macOS x64 (Intel). Installed automatically by @promptsign/verify.",
   "license": "Apache-2.0",
   "repository": {

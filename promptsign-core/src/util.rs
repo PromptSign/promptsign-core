@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -44,6 +45,39 @@ pub fn promptsign_home() -> PathBuf {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => home_dir().join(".promptsign"),
     }
+}
+
+/// Write a file owned by one user and restrict it to `0600` on Unix.
+///
+/// Files under `promptsign_home` include the private key, pin store, and
+/// global policy. The latter two are not secrets, but they record the
+/// identities a user trusts and the policies they enforce, so they should
+/// not be writable or readable by other users on a shared machine.
+///
+/// This does not protect against an attacker who can already write the home
+/// directory. Such an attacker can replace the policy, cached trust roots,
+/// or binary on `PATH` regardless. This follows the `known_hosts` model and
+/// is deliberate.
+///
+/// Permissions are applied after writing rather than at creation time. This
+/// avoids platform-specific open flags for files whose contents are already
+/// available to anyone who can run the CLI, at the cost of briefly retaining
+/// an existing file's previous mode.
+///
+/// Permission-setting failures are ignored deliberately: a filesystem that
+/// cannot represent the mode should not turn a successful write into an
+/// error. Windows has no equivalent, and its profile directory is already
+/// per-user.
+pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    fs::write(path, contents)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Same semantics as the Node implementation's globMatch: '*' matches any

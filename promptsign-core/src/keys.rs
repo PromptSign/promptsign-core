@@ -2,7 +2,7 @@
 // certificates replace long-lived local keys later in Phase 2; the bundle
 // format already carries the signer block needed for that transition.
 
-use crate::util::{promptsign_home, sha256_hex, short16};
+use crate::util::{promptsign_home, sha256_hex, short16, write_private};
 use crate::Result;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
@@ -44,13 +44,7 @@ pub fn keygen(dir: Option<&Path>, force: bool, identity: Option<&str>) -> Result
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| format!("key encoding failed: {e}"))?;
 
-    fs::write(&key_path, pem.as_bytes()).map_err(|e| format!("{}: {e}", key_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-    }
+    write_private(&key_path, pem.as_bytes()).map_err(|e| format!("{}: {e}", key_path.display()))?;
 
     let pub_pem = key
         .verifying_key()

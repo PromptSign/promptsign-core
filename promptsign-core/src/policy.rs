@@ -2,7 +2,7 @@
 // A signature without policy is meaningless: anyone can validly sign as
 // themselves. Policy decides which identities may sign which names.
 
-use crate::util::{glob_match, iso8601_now, promptsign_home, short16};
+use crate::util::{glob_match, iso8601_now, promptsign_home, short16, write_private};
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -168,7 +168,7 @@ pub fn save_pins(pins: &Pins) -> Result<()> {
 
     let p = pins_path();
 
-    fs::write(&p, serde_json::to_string_pretty(pins).unwrap() + "\n")
+    write_private(&p, serde_json::to_string_pretty(pins).unwrap() + "\n")
         .map_err(|e| format!("{}: {e}", p.display()))
 }
 
