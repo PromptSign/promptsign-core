@@ -9,13 +9,25 @@ use std::path::Path;
 
 pub const MANIFEST_SCHEMA: &str = "promptsign/manifest/v1";
 
-const SKIP_DIRS: [&str; 5] = [
+const SKIP_DIRS: [&str; 6] = [
     ".promptsign",
     ".git",
     "node_modules",
     "__pycache__",
     ".venv",
+    // Host-owned bookkeeping directory that the Claude Code runtime writes into a
+    // versioned plugin cache directory after install. The publisher does not
+    // write it, so it is not part of the signed artifact.
+    ".in_use",
 ];
+/// Host-owned bookkeeping files that the Claude Code runtime writes into a
+/// versioned plugin cache directory after install. The publisher does not
+/// write them, and they are not part of the signed artifact. See
+/// spec/01-manifest.md "Host-owned bookkeeping" for the full, closed list.
+/// Unlike `--exclude`, a signer cannot grow this list to carve a hole in
+/// their own signature: it changes only when the runtime's own bookkeeping
+/// set changes.
+const SKIP_FILES: [&str; 1] = [".orphaned_at"];
 const EXEC_EXTS: [&str; 16] = [
     ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".psm1", ".cmd", ".bat",
     ".exe", ".rb", ".pl", ".php",
@@ -153,7 +165,7 @@ fn walk(root: &Path, rel: &str, out: &mut Tree) -> Result<()> {
             }
             walk(root, &rel_child, out)?;
         } else if ftype.is_file() {
-            if is_sidecar(&name) {
+            if is_sidecar(&name) || SKIP_FILES.contains(&name.as_str()) {
                 continue;
             }
             out.files.push(rel_child);
@@ -545,6 +557,46 @@ mod tests {
         assert_eq!(strip_md_ext("REVIEWER.MD"), "REVIEWER");
         assert_eq!(strip_md_ext("notes.markdown"), "notes");
         assert_eq!(strip_md_ext("script.py"), "script.py");
+    }
+
+    // Claude Code writes `.in_use/<pid>` into the signed directory while a
+    // session holds an installed plugin, and writes `.orphaned_at` there once
+    // a newer version supersedes it. Neither file is part of the signed
+    // artifact. A genuine, correctly-signed release must still verify clean
+    // with them present, or every installed plugin on the machine reports a
+    // false FAIL the moment a session opens it.
+    #[test]
+    fn host_owned_bookkeeping_paths_do_not_break_verification() {
+        let dir = std::env::temp_dir().join(format!("ps_hostowned_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "# skill\n").unwrap();
+
+        let opts = BuildOptions {
+            name: Some("t"),
+            version: Some("1.0.0"),
+            kind: Some("skill"),
+        };
+        let manifest = build_manifest(&dir, None, &opts).unwrap();
+
+        assert_eq!(
+            manifest.files.len(),
+            1,
+            "host-owned paths must not be signed"
+        );
+
+        fs::create_dir_all(dir.join(".in_use")).unwrap();
+        fs::write(dir.join(".in_use/60356"), r#"{"pid":60356}"#).unwrap();
+        fs::write(dir.join(".orphaned_at"), "1788889068596").unwrap();
+
+        let problems = check_integrity(&dir, &manifest).unwrap();
+
+        assert!(
+            problems.is_empty(),
+            "host-owned bookkeeping must not fail verification, got {problems:?}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // A symlink grafts whatever it points at into the bundle without the walk
