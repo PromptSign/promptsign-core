@@ -141,6 +141,58 @@ Wire compatibility with the Node reference implementation is enforced by a cross
 
 When this crate and the spec disagree, the spec is right.
 
+## Releasing
+
+This repo cuts two independent releases. Neither version number derives from
+the other, so each gets its own bump and its own tag.
+
+| Release | Version lives in | Tag | Publishes to |
+|---|---|---|---|
+| `promptsign-core` crate | `Cargo.toml` `[workspace.package].version` | `core-vX.Y.Z` | crates.io, via `.github/workflows/publish-crate.yml` (trusted publishing, no token) |
+| `@promptsign/verify` (napi) | `promptsign-napi/package.json` `.version` | `verify-vX.Y.Z` | npm, 8 packages, via `.github/workflows/publish-verify.yml` (trusted publishing, no token) |
+
+### 1. Release the `promptsign-core` crate
+
+1. In `Cargo.toml`, set `[workspace.package].version` to `X.Y.Z`. This also
+   moves `promptsign-napi`'s *crate* version, since it inherits the workspace
+   version. That is expected, and unrelated to the napi *npm* version in
+   step 2 below.
+2. `cargo test -p promptsign-core --locked`
+3. `git commit -am "Release promptsign-core X.Y.Z"`
+4. `git tag core-vX.Y.Z`
+5. `git push origin main && git push origin core-vX.Y.Z`
+6. Watch `publish-crate.yml` finish and confirm `X.Y.Z` is live on crates.io
+   before moving on to a `promptsign-cli` release (see below).
+
+### 2. Release `@promptsign/verify` (napi)
+
+`promptsign-napi/package.json`'s `version` is a separate field from the crate
+version above, and `npm publish` reads it, not `Cargo.toml`.
+
+1. From `promptsign-napi/`: `npm version X.Y.Z --no-git-tag-version`
+2. `npm run sync-versions`, which copies the new version into the 7
+   `npm/*/package.json` platform packages and into the main package's
+   `optionalDependencies` pins.
+3. `git add promptsign-napi/package.json promptsign-napi/npm/*/package.json`
+4. `git commit -m "Release @promptsign/verify X.Y.Z"`
+5. `git tag verify-vX.Y.Z`
+6. `git push origin main && git push origin verify-vX.Y.Z`
+7. Watch `publish-verify.yml` finish.
+
+Skip steps 1-2 and tag directly, and `npm publish` rejects the release with
+"cannot publish over the previously published version": every platform
+package still carries the old version number.
+
+### 3. Downstream: `promptsign-cli`
+
+`promptsign-cli` lives in its own repo and depends on the published
+`promptsign-core` crate, not this checkout. Once step 1 above is live on
+crates.io: in the `promptsign-cli` repo, bump its `Cargo.toml` version and its
+`promptsign-core = "X.Y.Z"` dependency line, run
+`cargo update -p promptsign-core --precise X.Y.Z` to refresh `Cargo.lock`
+against the now-published crate, commit both files together, then tag and
+push that repo's own `vX.Y.Z`.
+
 ## Security
 
 > [!IMPORTANT]

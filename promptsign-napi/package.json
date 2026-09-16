@@ -1,6 +1,6 @@
 {
   "name": "@promptsign/verify",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Embed the PromptSign verifier — the same audited Rust core as the CLI — in Node. Verify-only.",
   "license": "Apache-2.0",
   "repository": {
@@ -24,12 +24,12 @@
     "test": "node --test"
   },
   "optionalDependencies": {
-    "@promptsign/verify-linux-x64-gnu": "0.3.2",
-    "@promptsign/verify-linux-arm64-gnu": "0.3.2",
-    "@promptsign/verify-linux-x64-musl": "0.3.2",
-    "@promptsign/verify-linux-arm64-musl": "0.3.2",
-    "@promptsign/verify-darwin-x64": "0.3.2",
-    "@promptsign/verify-darwin-arm64": "0.3.2",
-    "@promptsign/verify-win32-x64-msvc": "0.3.2"
+    "@promptsign/verify-linux-x64-gnu": "0.3.3",
+    "@promptsign/verify-linux-arm64-gnu": "0.3.3",
+    "@promptsign/verify-linux-x64-musl": "0.3.3",
+    "@promptsign/verify-linux-arm64-musl": "0.3.3",
+    "@promptsign/verify-darwin-x64": "0.3.3",
+    "@promptsign/verify-darwin-arm64": "0.3.3",
+    "@promptsign/verify-win32-x64-msvc": "0.3.3"
   }
 }
