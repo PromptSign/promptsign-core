@@ -188,6 +188,11 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     let marker_msgs = context_marker_messages(&abs, is_dir);
 
     let (bundle_value, _bundle_path) = match locate_bundle(&abs)? {
+        // No PromptSign bundle: an OMS signature in the directory is the
+        // signature to check, and a broken one is invalid, never unsigned.
+        BundleSource::None if is_dir && oms::signature_file(&abs).is_some() => {
+            return verify_oms(target, opts);
+        }
         BundleSource::None => {
             let out = evaluate(
                 &policy,
@@ -313,8 +318,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         payload_digest: subject.payload_digest,
         log_index: subject.log_index,
     };
-
-    finish(
+    let mut result = finish(
         target,
         &policy,
         policy_source,
@@ -323,7 +327,19 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         signed,
         findings,
         action,
-    )
+    )?;
+
+    // A PromptSign bundle takes precedence over an OMS signature beside it.
+    if let Some(oms_sig) = is_dir.then(|| oms::signature_file(&abs)).flatten() {
+        result.findings.push(Finding {
+            level: "info".to_string(),
+            message: format!(
+                "{} not checked: the PromptSign signature takes precedence",
+                basename(&oms_sig)
+            ),
+        });
+    }
+    Ok(result)
 }
 
 const FORMAT_PROMPTSIGN: &str = "promptsign";

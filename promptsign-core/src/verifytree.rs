@@ -1,7 +1,9 @@
 // Discover and verify every signable instruction artifact under given roots:
-// bundle directories (.promptsign/bundle.json), sidecar-signed files
-// (*.psig.json), and well-known instruction files that SHOULD be signed.
+// bundle directories (.promptsign/bundle.json, or an OMS signature file),
+// sidecar-signed files (*.psig.json), and well-known instruction files that
+// SHOULD be signed.
 
+use crate::oms;
 use crate::verify::{verify_target, VerifyOptions, VerifyResult};
 use crate::Result;
 use std::collections::HashSet;
@@ -42,7 +44,7 @@ fn walk(dir: &Path, bundle_dirs: &mut Vec<PathBuf>, files: &mut Vec<PathBuf>) {
         Err(_) => return,
     };
 
-    if dir.join(".promptsign").join("bundle.json").exists() {
+    if dir.join(".promptsign").join("bundle.json").exists() || oms::signature_file(dir).is_some() {
         bundle_dirs.push(dir.to_path_buf());
     }
     for ent in entries.flatten() {
