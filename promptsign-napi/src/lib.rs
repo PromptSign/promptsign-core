@@ -71,12 +71,14 @@ pub fn verify_keyless(bundle_json: String) -> Result<String> {
     .map_err(|e| err(e.to_string()))
 }
 
-/// The effective policy for a directory, as JSON (like `promptsign policy show`).
+/// The user's policy as JSON (like `promptsign policy show`). `dir` is the
+/// project directory; its own `.promptsign/policy.json` can only tighten the
+/// user's policy, so it is checked for validity here but not returned.
 #[napi]
 pub fn policy_show(dir: String) -> Result<String> {
-    let (_policy, raw, _src) =
-        promptsign_core::policy::load_policy(None, &PathBuf::from(dir)).map_err(err)?;
+    let (_policy, raw, _src) = promptsign_core::policy::load_policy(None).map_err(err)?;
 
+    promptsign_core::policy::load_project_policy(&PathBuf::from(dir)).map_err(err)?;
     serde_json::to_string(&raw).map_err(|e| err(e.to_string()))
 }
 

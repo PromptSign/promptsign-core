@@ -71,11 +71,26 @@ pub fn default_policy() -> Policy {
     }
 }
 
-/// Resolution order: explicit path, $PROMPTSIGN_POLICY, project
-/// .promptsign/policy.json, ~/.promptsign/policy.json, built-in default.
+fn read_policy_file(p: &Path) -> Result<(Policy, Value)> {
+    let text = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let raw: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+
+    if raw.get("schema").and_then(|s| s.as_str()) != Some(POLICY_SCHEMA) {
+        return Err(format!("{}: unsupported policy schema", p.display()));
+    }
+
+    let policy: Policy =
+        serde_json::from_value(raw.clone()).map_err(|e| format!("{}: {e}", p.display()))?;
+
+    Ok((policy, raw))
+}
+
+/// The user's policy (spec/04). Resolution order: explicit path,
+/// $PROMPTSIGN_POLICY, ~/.promptsign/policy.json, built-in default. A project
+/// directory never supplies it: see [`load_project_policy`].
 /// The raw Value is kept alongside the typed policy so `policy show` can
 /// print unknown fields (revocation_feed, require_attestations, ...) verbatim.
-pub fn load_policy(explicit: Option<&Path>, project_dir: &Path) -> Result<(Policy, Value, String)> {
+pub fn load_policy(explicit: Option<&Path>) -> Result<(Policy, Value, String)> {
     let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
 
     if let Some(p) = explicit {
@@ -86,21 +101,11 @@ pub fn load_policy(explicit: Option<&Path>, project_dir: &Path) -> Result<(Polic
             candidates.push((PathBuf::from(env_p), false));
         }
     }
-    candidates.push((project_dir.join(".promptsign").join("policy.json"), false));
     candidates.push((promptsign_home().join("policy.json"), false));
 
     for (p, is_explicit) in candidates {
         if p.exists() {
-            let text = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let raw: Value =
-                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
-
-            if raw.get("schema").and_then(|s| s.as_str()) != Some(POLICY_SCHEMA) {
-                return Err(format!("{}: unsupported policy schema", p.display()));
-            }
-
-            let policy: Policy =
-                serde_json::from_value(raw.clone()).map_err(|e| format!("{}: {e}", p.display()))?;
+            let (policy, raw) = read_policy_file(&p)?;
 
             return Ok((policy, raw, p.display().to_string()));
         }
@@ -113,6 +118,51 @@ pub fn load_policy(explicit: Option<&Path>, project_dir: &Path) -> Result<(Polic
     let raw = serde_json::to_value(&policy).unwrap();
 
     Ok((policy, raw, "(built-in default)".to_string()))
+}
+
+pub fn project_policy_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".promptsign").join("policy.json")
+}
+
+/// A project's own policy, `<project>/.promptsign/policy.json`, if it has
+/// one. The project is untrusted input: this policy can only add
+/// requirements on top of the user's, never relax them or add trust.
+pub fn load_project_policy(project_dir: &Path) -> Result<Option<(Policy, Value, String)>> {
+    let p = project_policy_path(project_dir);
+
+    if !p.exists() {
+        return Ok(None);
+    }
+
+    let (policy, raw) = read_policy_file(&p)?;
+
+    Ok(Some((policy, raw, p.display().to_string())))
+}
+
+/// The user's policy plus, when present, the project's tighten-only policy.
+pub struct EffectivePolicy {
+    pub user: Policy,
+    pub project: Option<Policy>,
+    /// Display form: the user's source, then the project's when present.
+    pub source: String,
+}
+
+pub fn load_effective_policy(
+    explicit: Option<&Path>,
+    project_dir: &Path,
+) -> Result<EffectivePolicy> {
+    let (user, _raw, user_source) = load_policy(explicit)?;
+    let project = load_project_policy(project_dir)?;
+    let source = match &project {
+        Some((_, _, p)) => format!("{user_source} + {p} (tighten only)"),
+        None => user_source,
+    };
+
+    Ok(EffectivePolicy {
+        user,
+        project: project.map(|(p, _, _)| p),
+        source,
+    })
 }
 
 /// First matching rule wins; fall back to the policy default action.
@@ -389,6 +439,38 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
         rule,
         pin_update,
     }
+}
+
+/// Evaluate the user's policy, then the project's on top of it. The project
+/// can only make the outcome stricter: its findings are added and the worse
+/// action wins. It never checks or writes TOFU pins (those are the user's).
+pub fn evaluate_with_project(
+    user: &Policy,
+    project: Option<&Policy>,
+    input: &EvalInput,
+    pins: &Pins,
+) -> EvalOutcome {
+    let mut out = evaluate(user, input, pins);
+
+    if let Some(project) = project {
+        let mut no_tofu = project.clone();
+
+        for r in &mut no_tofu.rules {
+            r.tofu = None;
+        }
+
+        let extra = evaluate(&no_tofu, input, &Pins::new());
+
+        out.findings
+            .extend(extra.findings.into_iter().map(|f| Finding {
+                level: f.level,
+                message: format!("project policy: {}", f.message),
+            }));
+        if extra.action > out.action {
+            out.action = extra.action;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -690,6 +772,129 @@ mod tests {
 
         assert_eq!(other_root.action, Action::Fail);
         assert!(other_root.findings[0].message.contains("TOFU pin mismatch"));
+    }
+
+    fn unsigned(name: &str) -> EvalInput<'_> {
+        EvalInput {
+            name,
+            identity: None,
+            keyid: None,
+            issuer: None,
+            root: None,
+            signed: false,
+        }
+    }
+
+    fn rule(pattern: &str, action: &str) -> Rule {
+        Rule {
+            pattern: pattern.into(),
+            action: Some(action.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_project_policy_cannot_relax_the_users() {
+        let user = policy_with(vec![rule("*", "enforce")]);
+        let project = policy_with(vec![rule("*", "off")]);
+        let out = evaluate_with_project(&user, Some(&project), &unsigned("x"), &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+    }
+
+    #[test]
+    fn a_project_policy_cannot_add_trust() {
+        let user = policy_with(vec![Rule {
+            identity: Some("https://github.com/acme/*".into()),
+            ..rule("*", "enforce")
+        }]);
+        let project = policy_with(vec![Rule {
+            identity: Some("https://github.com/evil/*".into()),
+            ..rule("*", "enforce")
+        }]);
+        let evil = keyless_input(
+            "https://github.com/evil/x/.github/workflows/s.yml@refs/tags/v1",
+            GHA,
+        );
+        let out = evaluate_with_project(&user, Some(&project), &evil, &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+    }
+
+    #[test]
+    fn a_project_policy_can_tighten() {
+        let user = default_policy();
+        let project = policy_with(vec![rule("*", "enforce")]);
+        let out = evaluate_with_project(&user, Some(&project), &unsigned("x"), &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+        assert!(
+            out.findings
+                .iter()
+                .any(|f| f.message.starts_with("project policy: ")),
+            "{:?}",
+            out.findings
+        );
+
+        // With no project policy the user's warn stands.
+        assert_eq!(
+            evaluate_with_project(&user, None, &unsigned("x"), &Pins::new()).action,
+            Action::Warn
+        );
+    }
+
+    #[test]
+    fn a_project_policy_never_writes_or_checks_pins() {
+        let user = policy_with(vec![rule("*", "warn")]);
+        let project = policy_with(vec![Rule {
+            tofu: Some(true),
+            ..rule("*", "warn")
+        }]);
+        let pins = keyless_pin("someone-else@example.com", GHA);
+        let out = evaluate_with_project(
+            &user,
+            Some(&project),
+            &keyless_input("dev@example.com", GHA),
+            &pins,
+        );
+
+        assert_eq!(out.action, Action::Pass, "{:?}", out.findings);
+        assert!(out.pin_update.is_none());
+    }
+
+    #[test]
+    fn the_project_policy_is_loaded_beside_the_users_not_instead() {
+        let base = std::env::temp_dir().join(format!("ps-policy-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("repo/.promptsign")).unwrap();
+
+        let user_path = base.join("user.json");
+
+        fs::write(
+            &user_path,
+            r#"{"schema":"promptsign/policy/v1","default":"enforce","rules":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            base.join("repo/.promptsign/policy.json"),
+            r#"{"schema":"promptsign/policy/v1","default":"off","rules":[]}"#,
+        )
+        .unwrap();
+
+        let eff = load_effective_policy(Some(&user_path), &base.join("repo")).unwrap();
+
+        assert_eq!(eff.user.default_action.as_deref(), Some("enforce"));
+        assert_eq!(
+            eff.project.as_ref().unwrap().default_action.as_deref(),
+            Some("off")
+        );
+        assert!(eff.source.contains("tighten only"), "{}", eff.source);
+
+        let none = load_effective_policy(Some(&user_path), &base).unwrap();
+
+        assert!(none.project.is_none());
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::manifest::{
 };
 use crate::oms;
 use crate::policy::{
-    evaluate, load_pins, load_policy, match_rule, save_pins, Action, EvalInput, Finding, Pins,
-    Policy,
+    evaluate_with_project, load_effective_policy, load_pins, match_rule, save_pins, Action,
+    EffectivePolicy, EvalInput, Finding, Pins, Policy,
 };
 use crate::revocation::{self, Subject};
 use crate::trustroot::load_registry;
@@ -180,7 +180,11 @@ fn apply_markers(
 
 pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
     let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (policy, _raw, policy_source) = load_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let EffectivePolicy {
+        user: policy,
+        project,
+        source: policy_source,
+    } = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
     let abs = std::path::absolute(target).map_err(|e| format!("{target}: {e}"))?;
     let md = std::fs::metadata(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
     let is_dir = md.is_dir();
@@ -194,8 +198,9 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
             return verify_oms(target, opts);
         }
         BundleSource::None => {
-            let out = evaluate(
+            let out = evaluate_with_project(
                 &policy,
+                project.as_ref(),
                 &EvalInput {
                     name: &fallback_name,
                     identity: None,
@@ -321,6 +326,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     let mut result = finish(
         target,
         &policy,
+        project.as_ref(),
         policy_source,
         &marker_msgs,
         opts,
@@ -367,6 +373,7 @@ struct Signed {
 fn finish(
     target: &str,
     policy: &Policy,
+    project: Option<&Policy>,
     policy_source: String,
     marker_msgs: &[String],
     opts: &VerifyOptions,
@@ -410,8 +417,9 @@ fn finish(
     } else {
         &signed.keyid
     };
-    let out = evaluate(
+    let out = evaluate_with_project(
         policy,
+        project,
         &EvalInput {
             name: &signed.name,
             identity: Some(&signed.identity),
@@ -534,7 +542,11 @@ fn signature_failure(
 /// markers, revocation and pins as a PromptSign bundle.
 pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
     let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (policy, _raw, policy_source) = load_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let EffectivePolicy {
+        user: policy,
+        project,
+        source: policy_source,
+    } = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
     let abs = std::path::absolute(target).map_err(|e| format!("{target}: {e}"))?;
 
     if !abs.is_dir() {
@@ -591,6 +603,7 @@ pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
     finish(
         target,
         &policy,
+        project.as_ref(),
         policy_source,
         &marker_msgs,
         opts,
