@@ -22,6 +22,9 @@ pub struct Rule {
     pub issuer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyid: Option<String>,
+    /// Registry root (spec/04) the signature must chain to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,6 +206,8 @@ pub struct EvalInput<'a> {
     pub keyid: Option<&'a str>,
     /// OIDC issuer — present iff the bundle is keyless.
     pub issuer: Option<&'a str>,
+    /// Registry root the signature chained to; absent for keyful bundles.
+    pub root: Option<&'a str>,
     pub signed: bool,
 }
 
@@ -220,6 +225,11 @@ pub struct EvalOutcome {
 /// that suffix, so the pin binds the workflow and ignores the ref. Keyful
 /// identities are free-form and compared whole.
 fn pin_identity<'a>(identity: &'a str, issuer: Option<&str>) -> &'a str {
+    // A certificate-mode signer is pinned by its root (the issuer carries the
+    // root fingerprint), so a rotated leaf under the same root keeps passing.
+    if issuer.is_some_and(|i| i.starts_with("x509:")) {
+        return "";
+    }
     if issuer.is_none() || !identity.starts_with("https://") {
         return identity;
     }
@@ -298,6 +308,20 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
             violate(
                 format!(
                     "issuer \"{issuer}\" not allowed for \"{}\" (expected {rule_issuer})",
+                    input.name
+                ),
+                &mut findings,
+                &mut action,
+            );
+        }
+    }
+    if let Some(rule_root) = &rule.trust_root {
+        let root = input.root.unwrap_or("");
+
+        if rule_root != root {
+            violate(
+                format!(
+                    "trust root \"{root}\" not allowed for \"{}\" (expected {rule_root})",
                     input.name
                 ),
                 &mut findings,
@@ -394,6 +418,7 @@ mod tests {
                 identity: None,
                 keyid: None,
                 issuer: None,
+                root: None,
                 signed: false,
             },
             &Pins::new(),
@@ -413,6 +438,7 @@ mod tests {
                 identity: None,
                 keyid: None,
                 issuer: None,
+                root: None,
                 signed: false,
             },
             &Pins::new(),
@@ -437,6 +463,7 @@ mod tests {
                 identity: Some("github:anthropic"),
                 keyid: Some("k"),
                 issuer: None,
+                root: None,
                 signed: true,
             },
             &Pins::new(),
@@ -451,6 +478,7 @@ mod tests {
                 identity: Some("github:evil"),
                 keyid: Some("k"),
                 issuer: None,
+                root: None,
                 signed: true,
             },
             &Pins::new(),
@@ -470,6 +498,7 @@ mod tests {
                 identity: Some("github:a"),
                 keyid: Some("k1"),
                 issuer: None,
+                root: None,
                 signed: true,
             },
             &pins,
@@ -488,6 +517,7 @@ mod tests {
                 identity: Some("github:a"),
                 keyid: Some("k1"),
                 issuer: None,
+                root: None,
                 signed: true,
             },
             &pins,
@@ -503,6 +533,7 @@ mod tests {
                 identity: Some("github:b"),
                 keyid: Some("k2"),
                 issuer: None,
+                root: None,
                 signed: true,
             },
             &pins,
@@ -521,6 +552,7 @@ mod tests {
             identity: Some(identity),
             keyid: Some(""),
             issuer: Some(issuer),
+            root: None,
             signed: true,
         }
     }
@@ -595,6 +627,71 @@ mod tests {
         );
     }
 
+    const NV_ROOT: &str =
+        "x509:sha256:6f1bb875b77aea3fc878a7a3237497235c53657601375c0ef4bdcde69e843782";
+
+    #[test]
+    fn trust_root_rule_requires_that_root() {
+        let p = policy_with(vec![Rule {
+            pattern: "*".into(),
+            trust_root: Some("nvidia".into()),
+            action: Some("enforce".into()),
+            ..Default::default()
+        }]);
+        let input = |root| EvalInput {
+            root,
+            ..keyless_input("CN=Signing 001", NV_ROOT)
+        };
+        let wrong = evaluate(&p, &input(Some("sigstore-public")), &Pins::new());
+
+        assert_eq!(wrong.action, Action::Fail);
+        assert!(
+            wrong.findings[0].message.contains("trust root"),
+            "{:?}",
+            wrong.findings
+        );
+
+        let missing = evaluate(&p, &input(None), &Pins::new());
+
+        assert_eq!(missing.action, Action::Fail);
+        assert_eq!(
+            evaluate(&p, &input(Some("nvidia")), &Pins::new()).action,
+            Action::Pass
+        );
+    }
+
+    #[test]
+    fn x509_pin_binds_the_root_not_the_leaf() {
+        let p = default_policy();
+        let pins = keyless_pin(
+            "CN=NVIDIA Agent Skills Signing 001,O=NVIDIA Corporation,C=US",
+            NV_ROOT,
+        );
+        let rotated = evaluate(
+            &p,
+            &keyless_input(
+                "CN=NVIDIA Agent Skills Signing 002,O=NVIDIA Corporation,C=US",
+                NV_ROOT,
+            ),
+            &pins,
+        );
+
+        assert_eq!(rotated.action, Action::Pass, "{:?}", rotated.findings);
+        assert!(rotated.pin_update.is_none());
+
+        let other_root = evaluate(
+            &p,
+            &keyless_input(
+                "CN=NVIDIA Agent Skills Signing 001,O=NVIDIA Corporation,C=US",
+                "x509:sha256:00",
+            ),
+            &pins,
+        );
+
+        assert_eq!(other_root.action, Action::Fail);
+        assert!(other_root.findings[0].message.contains("TOFU pin mismatch"));
+    }
+
     #[test]
     fn off_action_suppresses_policy_findings() {
         let p = policy_with(vec![Rule {
@@ -609,6 +706,7 @@ mod tests {
                 identity: None,
                 keyid: None,
                 issuer: None,
+                root: None,
                 signed: false,
             },
             &Pins::new(),

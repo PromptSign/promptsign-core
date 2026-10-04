@@ -22,6 +22,8 @@ x509-cert = { version = "0.2", features = ["pem"] }
 der = "0.7"
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
+# RSA chain links (enterprise CAs); verification only, no private-key operations
+rsa = { version = "0.9", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 x509-cert = { version = "0.2", features = ["pem", "builder"] }

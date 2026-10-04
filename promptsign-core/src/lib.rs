@@ -8,11 +8,14 @@
 
 pub mod bundle;
 pub mod canonicalize;
+mod chain;
 pub mod keyless;
 pub mod keys;
 pub mod manifest;
 pub mod policy;
 pub mod revocation;
+pub mod sigstore_bundle;
+pub mod trustroot;
 pub mod util;
 pub mod verify;
 pub mod verifytree;

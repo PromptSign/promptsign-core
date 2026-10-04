@@ -117,6 +117,8 @@ pub struct VerifiedEnvelope {
     pub keyid: String,
     /// OIDC issuer from the leaf certificate — present iff the bundle is keyless.
     pub issuer: Option<String>,
+    /// Registry root the keyless chain ended at; absent for keyful bundles.
+    pub root: Option<String>,
 }
 
 /// Cryptographic verification only — integrity against disk and trust policy
@@ -147,6 +149,7 @@ pub fn verify_envelope(bundle: &Value) -> Result<VerifiedEnvelope> {
             identity: kv.identity,
             keyid: kv.leaf_keyid,
             issuer: Some(kv.issuer),
+            root: Some(kv.root),
         });
     }
     if str_at(bundle, &["signer", "scheme"]) != Some("ed25519") {
@@ -202,6 +205,7 @@ pub fn verify_envelope(bundle: &Value) -> Result<VerifiedEnvelope> {
         identity,
         keyid,
         issuer: None,
+        root: None,
     })
 }
 
