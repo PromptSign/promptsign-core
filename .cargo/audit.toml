@@ -1,0 +1,10 @@
+# cargo audit configuration. Every ignore needs a reason that stays true.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071, rsa: Marvin timing side channel in private-key
+    # operations (decryption, signing). promptsign-core uses rsa only to verify
+    # RSA signatures on CA certificates with public keys; it never holds or
+    # uses an RSA private key, so the affected code is unreachable. No fixed
+    # rsa release exists yet; drop this ignore when one does.
+    "RUSTSEC-2023-0071",
+]

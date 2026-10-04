@@ -64,7 +64,11 @@ fn a_repository_policy_cannot_weaken_or_self_authorize() {
     let r = verify_target("CLAUDE.md", &opts).unwrap();
 
     assert_eq!(r.action, Action::Fail, "{:?}", r.findings);
-    assert!(r.policy_source.contains("tighten only"), "{}", r.policy_source);
+    assert!(
+        r.policy_source.contains("tighten only"),
+        "{}",
+        r.policy_source
+    );
 
     // 2. The repo names its own key as trusted and signs its skill with it.
     fs::write(
@@ -77,10 +81,22 @@ fn a_repository_policy_cannot_weaken_or_self_authorize() {
     .unwrap();
     fs::write(skill.join("SKILL.md"), "---\nname: deploy\n---\n# Deploy\n").unwrap();
 
-    let manifest =
-        build_manifest(&skill, None, &BuildOptions { name: Some("repo/deploy"), version: None, kind: None }).unwrap();
+    let manifest = build_manifest(
+        &skill,
+        None,
+        &BuildOptions {
+            name: Some("repo/deploy"),
+            version: None,
+            kind: None,
+        },
+    )
+    .unwrap();
 
-    write_bundle(&skill, &sign_manifest(&manifest, &attacker, "attacker").unwrap()).unwrap();
+    write_bundle(
+        &skill,
+        &sign_manifest(&manifest, &attacker, "attacker").unwrap(),
+    )
+    .unwrap();
 
     let r = verify_target("skills/deploy", &opts).unwrap();
 
@@ -88,12 +104,18 @@ fn a_repository_policy_cannot_weaken_or_self_authorize() {
 
     // 3. Signed by the key the user trusts, it passes; the repo's stricter
     //    rule (its own key) adds a finding but cannot be the only one obeyed.
-    write_bundle(&skill, &sign_manifest(&manifest, &trusted, "publisher").unwrap()).unwrap();
+    write_bundle(
+        &skill,
+        &sign_manifest(&manifest, &trusted, "publisher").unwrap(),
+    )
+    .unwrap();
 
     let r = verify_target("skills/deploy", &opts).unwrap();
 
     assert!(
-        r.findings.iter().any(|f| f.message.starts_with("project policy: ")),
+        r.findings
+            .iter()
+            .any(|f| f.message.starts_with("project policy: ")),
         "{:?}",
         r.findings
     );

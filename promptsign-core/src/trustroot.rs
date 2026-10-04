@@ -9,7 +9,7 @@
 
 use crate::chain::{is_self_signed, subject_of};
 use crate::keyless::{parse_rekor_logs, trust_dir, RekorLog};
-use crate::util::{hex, sha256_hex};
+use crate::util::{hex, promptsign_home, sha256_hex};
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use der::{Decode, Encode};
@@ -210,67 +210,112 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every root in the user's trust directory.
+/// Where the user's named roots live: `$PROMPTSIGN_HOME/trust/roots`. Unlike
+/// the pinned public root, this never follows PROMPTSIGN_TRUST_DIR, which a
+/// host (the npm package) may point at a bundled, read-only copy.
+pub fn user_trust_dir() -> PathBuf {
+    promptsign_home().join("trust")
+}
+
+/// Every root the user trusts: the pinned public root from the trust
+/// directory, then the user's named roots.
 pub fn load_registry() -> Result<Vec<Root>> {
-    load_registry_from(&trust_dir())
+    let mut roots: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
+
+    roots.extend(load_named(&roots_dir(&user_trust_dir()))?);
+    Ok(roots)
 }
 
 /// Every root in `dir`: the built-in pinned pair first (when present), then
 /// `roots/*.json` by name. A root file that does not parse is an error, not
 /// a silent skip.
 pub fn load_registry_from(dir: &Path) -> Result<Vec<Root>> {
-    let mut roots = Vec::new();
+    let mut roots: Vec<Root> = load_pinned(dir)?.into_iter().collect();
+
+    roots.extend(load_named(&roots_dir(dir))?);
+    Ok(roots)
+}
+
+fn load_pinned(dir: &Path) -> Result<Option<Root>> {
     let fulcio = dir.join("fulcio.pem");
     let rekor = dir.join("rekor.pub");
 
-    if fulcio.exists() && rekor.exists() {
-        let pem = fs::read(&fulcio).map_err(|e| format!("{}: {e}", fulcio.display()))?;
-        let rekor_pem =
-            fs::read_to_string(&rekor).map_err(|e| format!("{}: {e}", rekor.display()))?;
+    if !fulcio.exists() || !rekor.exists() {
+        return Ok(None);
+    }
+
+    let pem = fs::read(&fulcio).map_err(|e| format!("{}: {e}", fulcio.display()))?;
+    let rekor_pem = fs::read_to_string(&rekor).map_err(|e| format!("{}: {e}", rekor.display()))?;
+
+    Root::from_pem(DEFAULT_ROOT, &pem, &rekor_pem)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+fn load_named(rdir: &Path) -> Result<Vec<Root>> {
+    let mut roots = Vec::new();
+
+    if !rdir.is_dir() {
+        return Ok(roots);
+    }
+
+    let mut files: Vec<PathBuf> = fs::read_dir(rdir)
+        .map_err(|e| format!("{}: {e}", rdir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+
+    files.sort();
+    for p in files {
+        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+
+        check_name(name).map_err(|e| format!("{}: {e}", p.display()))?;
+
+        let doc: Value =
+            serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)
+                .map_err(|e| format!("{}: {e}", p.display()))?;
 
         roots.push(
-            Root::from_pem(DEFAULT_ROOT, &pem, &rekor_pem)
-                .map_err(|e| format!("{}: {e}", dir.display()))?,
+            Root::from_trusted_root(name, &doc).map_err(|e| format!("{}: {e}", p.display()))?,
         );
     }
-
-    let rdir = roots_dir(dir);
-
-    if rdir.is_dir() {
-        let mut files: Vec<PathBuf> = fs::read_dir(&rdir)
-            .map_err(|e| format!("{}: {e}", rdir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-            .collect();
-
-        files.sort();
-        for p in files {
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-
-            check_name(name).map_err(|e| format!("{}: {e}", p.display()))?;
-
-            let doc: Value =
-                serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)
-                    .map_err(|e| format!("{}: {e}", p.display()))?;
-
-            roots.push(
-                Root::from_trusted_root(name, &doc).map_err(|e| format!("{}: {e}", p.display()))?,
-            );
-        }
-    }
     Ok(roots)
+}
+
+/// Add a certificate-mode root to the user's registry.
+pub fn add_user_ca_root(name: &str, ca_pem: &[u8]) -> Result<Root> {
+    add_ca_root(&user_trust_dir(), name, ca_pem)
+}
+
+/// Add a `trusted_root.json` document to the user's registry.
+pub fn add_user_trusted_root(name: &str, doc: &Value) -> Result<Root> {
+    add_trusted_root(&user_trust_dir(), name, doc)
+}
+
+/// Remove a named root from the user's registry.
+pub fn remove_user_root(name: &str) -> Result<()> {
+    remove_root(&user_trust_dir(), name)
 }
 
 /// Add a certificate-mode root from PEM CA certificates. Refuses a name in
 /// use and a root already trusted under another name.
 pub fn add_ca_root(dir: &Path, name: &str, ca_pem: &[u8]) -> Result<Root> {
     check_name(name)?;
+    store_root(dir, Root::ca_only(name, ca_pem)?)
+}
 
-    let root = Root::ca_only(name, ca_pem)?;
-    let path = roots_dir(dir).join(format!("{name}.json"));
+/// Add a root from a Sigstore `trusted_root.json` document (a private
+/// Sigstore deployment, or a CA published in that shape).
+pub fn add_trusted_root(dir: &Path, name: &str, doc: &Value) -> Result<Root> {
+    check_name(name)?;
+    store_root(dir, Root::from_trusted_root(name, doc)?)
+}
+
+fn store_root(dir: &Path, root: Root) -> Result<Root> {
+    let path = roots_dir(dir).join(format!("{}.json", root.name));
 
     if path.exists() {
-        return Err(format!("trust root \"{name}\" already exists"));
+        return Err(format!("trust root \"{}\" already exists", root.name));
     }
     if let Some(same) = load_registry_from(dir)?
         .into_iter()

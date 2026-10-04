@@ -153,8 +153,14 @@ function policyShow(dir) {
 }
 
 /** The wrapped promptsign-core version. */
+/** Every trust root the verifier accepts (pinned public root, then the user's
+ * named roots). */
+function trustRoots() {
+  return withTrustRoot(() => JSON.parse(native.trustRoots()));
+}
+
 function coreVersion() {
   return native.coreVersion();
 }
 
-module.exports = { verify, verifyTree, verifyKeyless, policyShow, coreVersion, trustRoot };
+module.exports = { verify, verifyTree, verifyKeyless, policyShow, coreVersion, trustRoot, trustRoots };

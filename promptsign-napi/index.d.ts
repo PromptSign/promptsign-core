@@ -26,6 +26,11 @@ export interface VerifyResult {
    * authenticated moment the signature was witnessed. Absent for local-key
    * signatures and unsigned/failed targets. */
   integratedTime?: number;
+  /** Signature format: "promptsign", or "oms" for an OpenSSF Model Signing
+   * bundle (skill.oms.sig, model.sig). Absent when unsigned. */
+  format?: 'promptsign' | 'oms';
+  /** Trust root the signer chained to (keyless and certificate mode). */
+  root?: string;
   signed: boolean;
   action: 'pass' | 'warn' | 'fail';
   findings: Finding[];
@@ -35,6 +40,18 @@ export interface KeylessInfo {
   identity: string;
   issuer: string;
   keyid: string;
+  /** Trust root the certificate chained to. */
+  root: string;
+}
+
+export interface RegistryRoot {
+  name: string;
+  /** "keyless": Fulcio CA plus transparency log. "certificate": a CA only,
+   * checked at the current time. */
+  kind: 'keyless' | 'certificate';
+  /** Hex SHA-256 of the anchor certificate. */
+  fingerprint: string;
+  subject: string;
 }
 
 /** Verify one target (directory or file). Mirrors `promptsign verify --json`. */
@@ -47,8 +64,13 @@ export function verifyTree(roots: string[], opts?: VerifyOpts): VerifyResult[];
  * Throws on any verification failure. */
 export function verifyKeyless(bundle: object | string): KeylessInfo;
 
-/** The effective policy for a directory (like `promptsign policy show`). */
+/** The user's policy (like `promptsign policy show`). A project's own
+ * `.promptsign/policy.json` in `dir` can only tighten it. */
 export function policyShow(dir: string): unknown;
+
+/** Every trust root the verifier accepts: the pinned public root, then the
+ * user's named roots from `~/.promptsign/trust/roots`. */
+export function trustRoots(): RegistryRoot[];
 
 /** The wrapped promptsign-core version. */
 export function coreVersion(): string;

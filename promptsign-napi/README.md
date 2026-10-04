@@ -12,7 +12,7 @@ root pinned in `trust/` — no network call, and nothing to fetch first.
 ## API
 
 ```js
-const { verify, verifyTree, verifyKeyless, policyShow, coreVersion } = require('@promptsign/verify');
+const { verify, verifyTree, verifyKeyless, policyShow, trustRoots, coreVersion } = require('@promptsign/verify');
 
 // Verify a signed directory or file. Same result as `promptsign verify --json`.
 const result = verify('./skills/pdf', { noPinUpdates: true });
@@ -24,13 +24,23 @@ if (result.action === 'fail') {
 const results = verifyTree(['./skills/pdf', './agents/reviewer.md']);
 
 // Offline keyless verification of a bundle object/JSON — throws on failure.
-const who = verifyKeyless(bundleJson); // { identity, issuer, keyid }
+const who = verifyKeyless(bundleJson); // { identity, issuer, keyid, root }
 
-// The effective policy for a directory (like `promptsign policy show`).
+// The user's policy (like `promptsign policy show`). A project's own
+// .promptsign/policy.json can only tighten it.
 const policy = policyShow('.');
+
+// Every trust root a signature may chain to: the pinned public Sigstore root,
+// then roots added with `promptsign trust add` (~/.promptsign/trust/roots).
+const roots = trustRoots(); // [{ name, kind, fingerprint, subject }]
 
 coreVersion(); // the wrapped promptsign-core version
 ```
+
+`verify` also reads OpenSSF Model Signing (OMS) bundles: a directory with
+`skill.oms.sig` or `model.sig` and no PromptSign bundle is verified against the
+user's trust roots, and the result carries `format: "oms"` and the `root` it
+chained to. A PromptSign bundle in the same directory takes precedence.
 
 `verify` / `verifyTree` return the same `VerifyResult` shape the CLI emits with
 `--json` (`action` is `"pass" | "warn" | "fail"`; see `index.d.ts`). Policy and 

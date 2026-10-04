@@ -56,7 +56,8 @@ pub fn verify_tree_json(roots: Vec<String>, opts: Option<VerifyOpts>) -> Result<
 }
 
 /// Offline keyless verification of a bundle (spec/05). Returns
-/// `{ identity, issuer, keyid }` as JSON, or throws on any verification failure.
+/// `{ identity, issuer, keyid, root }` as JSON, or throws on any verification
+/// failure.
 #[napi]
 pub fn verify_keyless(bundle_json: String) -> Result<String> {
     let bundle: serde_json::Value =
@@ -67,6 +68,7 @@ pub fn verify_keyless(bundle_json: String) -> Result<String> {
         "identity": kv.identity,
         "issuer": kv.issuer,
         "keyid": kv.leaf_keyid,
+        "root": kv.root,
     }))
     .map_err(|e| err(e.to_string()))
 }
@@ -80,6 +82,27 @@ pub fn policy_show(dir: String) -> Result<String> {
 
     promptsign_core::policy::load_project_policy(&PathBuf::from(dir)).map_err(err)?;
     serde_json::to_string(&raw).map_err(|e| err(e.to_string()))
+}
+
+/// Every trust root the verifier accepts: the pinned public root, then the
+/// user's named roots (`promptsign trust add`). JSON array of
+/// `{ name, kind, fingerprint, subject }`, kind "keyless" or "certificate".
+#[napi]
+pub fn trust_roots() -> Result<String> {
+    let roots = promptsign_core::trustroot::load_registry().map_err(err)?;
+    let out: Vec<serde_json::Value> = roots
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "kind": if r.is_ca_only() { "certificate" } else { "keyless" },
+                "fingerprint": r.fingerprint,
+                "subject": r.subject,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&out).map_err(|e| err(e.to_string()))
 }
 
 /// The wrapped promptsign-core version, so consumers can assert the verifier build.
