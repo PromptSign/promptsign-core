@@ -98,6 +98,20 @@ fn check_invisible(lines: &[String]) -> Result<(), CanonError> {
     Ok(())
 }
 
+/// The invisible-character rules alone, for Markdown that someone else signed
+/// as raw bytes: strict UTF-8, then the same checks as canonicalization.
+pub fn check_markdown_text(buf: &[u8]) -> Result<(), CanonError> {
+    let text = std::str::from_utf8(buf).map_err(|_| CanonError::new("invalid UTF-8", None))?;
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::to_string)
+        .collect();
+
+    check_invisible(&lines)
+}
+
 /// Remove an `x-promptsign:` mapping from YAML frontmatter (embedded-signature
 /// fallback carriage) so the signature is not part of the signed content.
 pub fn strip_signature_block(text: &str) -> String {

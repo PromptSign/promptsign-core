@@ -48,6 +48,8 @@ pub struct VerifiedStatement {
     pub payload: Vec<u8>,
     /// Log integration time; keyless only.
     pub integrated_time: Option<i64>,
+    /// Log index of the entry; keyless only.
+    pub log_index: Option<i64>,
 }
 
 pub fn is_sigstore_bundle(v: &Value) -> bool {
@@ -143,7 +145,7 @@ pub fn verify_sigstore_bundle(
         };
 
         match attempt {
-            Ok((mode, identity, issuer, integrated_time)) => {
+            Ok((mode, identity, issuer, integrated_time, log_index)) => {
                 return Ok(VerifiedStatement {
                     mode,
                     identity,
@@ -158,6 +160,7 @@ pub fn verify_sigstore_bundle(
                     payload_type,
                     payload,
                     integrated_time,
+                    log_index,
                 })
             }
             Err(e) => first_error = first_error.or(Some(e)),
@@ -166,7 +169,7 @@ pub fn verify_sigstore_bundle(
     Err(first_error.unwrap_or_else(|| "no trust root verified this bundle".to_string()))
 }
 
-type ModeResult = Result<(SignerMode, String, String, Option<i64>)>;
+type ModeResult = Result<(SignerMode, String, String, Option<i64>, Option<i64>)>;
 
 fn verify_certificate_mode(
     chain: &[Certificate],
@@ -190,6 +193,7 @@ fn verify_certificate_mode(
         SignerMode::Certificate,
         subject_of(leaf),
         String::new(),
+        None,
         None,
     ))
 }
@@ -237,5 +241,6 @@ fn verify_keyless_mode(
         parts.identity,
         parts.issuer,
         Some(parts.integrated_time),
+        Some(tlog.log_index),
     ))
 }

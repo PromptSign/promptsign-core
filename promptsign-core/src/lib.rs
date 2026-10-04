@@ -12,6 +12,7 @@ mod chain;
 pub mod keyless;
 pub mod keys;
 pub mod manifest;
+pub mod oms;
 pub mod policy;
 pub mod revocation;
 pub mod sigstore_bundle;

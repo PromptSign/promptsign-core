@@ -6,11 +6,13 @@ use crate::bundle::{has_signature_marker, locate_bundle, verify_envelope, Bundle
 use crate::manifest::{
     check_file_integrity, check_integrity, strip_md_ext, walk_files, CONTEXT_INJECTED,
 };
+use crate::oms;
 use crate::policy::{
     evaluate, load_pins, load_policy, match_rule, save_pins, Action, EvalInput, Finding, Pins,
     Policy,
 };
 use crate::revocation::{self, Subject};
+use crate::trustroot::load_registry;
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use serde::Serialize;
@@ -43,6 +45,12 @@ pub struct VerifyResult {
     /// signatures and on any unverified/failed path.
     #[serde(rename = "integratedTime", skip_serializing_if = "Option::is_none")]
     pub integrated_time: Option<i64>,
+    /// Signature format: "promptsign" or "oms". Absent when unsigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Trust root the signer chained to (keyless and certificate mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     pub signed: bool,
     pub action: Action,
     pub findings: Vec<Finding>,
@@ -213,6 +221,8 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 issuer: None,
                 keyid: None,
                 integrated_time: None,
+                format: None,
+                root: None,
                 signed: false,
                 action,
                 findings,
@@ -243,6 +253,8 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 issuer: None,
                 keyid: None,
                 integrated_time: None,
+                format: Some(FORMAT_PROMPTSIGN.to_string()),
+                root: None,
                 signed: true,
                 action,
                 findings,
@@ -254,41 +266,15 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     let envelope = match verify_envelope(&bundle_value) {
         Ok(env) => env,
         Err(e) => {
-            // A broken/forged signature is never silently ignored: at least a
-            // warning even under action "off", a failure under "warn"/"enforce".
-            let off = policy_off(&policy, &fallback_name);
-            let mut action = if off { Action::Warn } else { Action::Fail };
-            let mut findings = vec![Finding {
-                level: if action == Action::Fail {
-                    "error"
-                } else {
-                    "warn"
-                }
-                .to_string(),
-                message: format!("invalid signature: {e}"),
-            }];
-
-            apply_markers(
-                &marker_msgs,
+            return Ok(signature_failure(
+                target,
                 &policy,
-                &fallback_name,
-                &mut findings,
-                &mut action,
-            );
-            return Ok(VerifyResult {
-                target: target.to_string(),
                 policy_source,
-                name: fallback_name,
-                version: None,
-                kind: None,
-                identity: None,
-                issuer: None,
-                keyid: None,
-                integrated_time: None,
-                signed: true,
-                action,
-                findings,
-            });
+                &marker_msgs,
+                fallback_name,
+                FORMAT_PROMPTSIGN,
+                format!("invalid signature: {e}"),
+            ))
         }
     };
 
@@ -313,10 +299,69 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         action = Action::Fail;
     }
 
+    let subject = revocation_subject(&bundle_value, "", None);
+    let signed = Signed {
+        name: manifest.name,
+        version: manifest.version,
+        kind: manifest.kind,
+        identity: envelope.identity,
+        issuer: envelope.issuer,
+        keyid: envelope.keyid,
+        root: envelope.root,
+        integrated_time: integrated_time_of(&bundle_value),
+        format: FORMAT_PROMPTSIGN,
+        payload_digest: subject.payload_digest,
+        log_index: subject.log_index,
+    };
+
+    finish(
+        target,
+        &policy,
+        policy_source,
+        &marker_msgs,
+        opts,
+        signed,
+        findings,
+        action,
+    )
+}
+
+const FORMAT_PROMPTSIGN: &str = "promptsign";
+const FORMAT_OMS: &str = "oms";
+
+/// What the signature step established, whatever format the bundle used.
+struct Signed {
+    name: String,
+    version: Option<String>,
+    kind: Option<String>,
+    identity: String,
+    /// OIDC issuer (keyless) or `x509:sha256:<root>` (certificate mode).
+    issuer: Option<String>,
+    keyid: String,
+    root: Option<String>,
+    integrated_time: Option<i64>,
+    format: &'static str,
+    payload_digest: String,
+    log_index: Option<i64>,
+}
+
+/// Policy, markers, revocation and TOFU pins over an authenticated signer.
+/// `findings`/`action` carry the integrity results so far.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    target: &str,
+    policy: &Policy,
+    policy_source: String,
+    marker_msgs: &[String],
+    opts: &VerifyOptions,
+    signed: Signed,
+    mut findings: Vec<Finding>,
+    mut action: Action,
+) -> Result<VerifyResult> {
     if opts.skip_policy {
         // No policy to consult, but a marker on a context-injected file must
         // still fail (self-check safety) — mirror integrity's unconditional Fail.
-        for m in &marker_msgs {
+        for m in marker_msgs {
             findings.push(Finding {
                 level: "error".to_string(),
                 message: m.clone(),
@@ -326,13 +371,15 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         return Ok(VerifyResult {
             target: target.to_string(),
             policy_source: "(skipped)".to_string(),
-            name: manifest.name,
-            version: manifest.version,
-            kind: manifest.kind,
-            identity: Some(envelope.identity),
-            issuer: envelope.issuer,
-            keyid: Some(envelope.keyid),
-            integrated_time: integrated_time_of(&bundle_value),
+            name: signed.name,
+            version: signed.version,
+            kind: signed.kind,
+            identity: Some(signed.identity),
+            issuer: signed.issuer,
+            keyid: Some(signed.keyid),
+            integrated_time: signed.integrated_time,
+            format: Some(signed.format.to_string()),
+            root: signed.root,
             signed: true,
             action,
             findings,
@@ -340,20 +387,21 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     }
 
     let mut pins = load_pins()?;
-    // Keyless bundles pin identity+issuer, never the ephemeral key (spec/05 §5).
-    let pin_keyid: &str = if envelope.issuer.is_some() {
+    // Keyless and certificate-mode signers pin identity+issuer, never the key
+    // (spec/05 §5): the ephemeral key changes every signing, a leaf rotates.
+    let pin_keyid: &str = if signed.issuer.is_some() {
         ""
     } else {
-        &envelope.keyid
+        &signed.keyid
     };
     let out = evaluate(
-        &policy,
+        policy,
         &EvalInput {
-            name: &manifest.name,
-            identity: Some(&envelope.identity),
+            name: &signed.name,
+            identity: Some(&signed.identity),
             keyid: Some(pin_keyid),
-            issuer: envelope.issuer.as_deref(),
-            root: envelope.root.as_deref(),
+            issuer: signed.issuer.as_deref(),
+            root: signed.root.as_deref(),
             signed: true,
         },
         &pins,
@@ -365,23 +413,25 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     }
 
     apply_markers(
-        &marker_msgs,
-        &policy,
-        &manifest.name,
+        marker_msgs,
+        policy,
+        &signed.name,
         &mut findings,
         &mut action,
     );
 
     // Revocation feed (spec/06): "valid yesterday, killed today". Consulted only
-    // when a feed is configured; the bundle_value fields read here were already
-    // authenticated by verify_envelope (payload signed; transparency SET-bound).
+    // when a feed is configured; every subject field comes from the
+    // authenticated bundle.
     if policy.revocation_feed.is_some() {
-        let subject = revocation_subject(
-            &bundle_value,
-            &envelope.identity,
-            envelope.issuer.as_deref(),
-        );
-        let rev = revocation::evaluate(&policy, &subject);
+        let subject = Subject {
+            identity: &signed.identity,
+            issuer: signed.issuer.as_deref(),
+            payload_digest: signed.payload_digest.clone(),
+            log_index: signed.log_index,
+            integrated_time: signed.integrated_time,
+        };
+        let rev = revocation::evaluate(policy, &subject);
 
         findings.extend(rev.findings);
         if rev.action > action {
@@ -395,7 +445,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 level: "info".to_string(),
                 message: format!(
                     "pinned \"{}\" to identity \"{}\" (trust on first use)",
-                    manifest.name, envelope.identity
+                    signed.name, signed.identity
                 ),
             });
             pins.insert(pin.name.clone(), pin);
@@ -406,17 +456,132 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     Ok(VerifyResult {
         target: target.to_string(),
         policy_source,
-        name: manifest.name,
-        version: manifest.version,
-        kind: manifest.kind,
-        identity: Some(envelope.identity),
-        issuer: envelope.issuer,
-        keyid: Some(envelope.keyid),
-        integrated_time: integrated_time_of(&bundle_value),
+        name: signed.name,
+        version: signed.version,
+        kind: signed.kind,
+        identity: Some(signed.identity),
+        issuer: signed.issuer,
+        keyid: Some(signed.keyid),
+        integrated_time: signed.integrated_time,
+        format: Some(signed.format.to_string()),
+        root: signed.root,
         signed: true,
         action,
         findings,
     })
+}
+
+/// A signature that does not verify is never silently ignored: at least a
+/// warning even under action "off", a failure under "warn"/"enforce".
+fn signature_failure(
+    target: &str,
+    policy: &Policy,
+    policy_source: String,
+    marker_msgs: &[String],
+    name: String,
+    format: &'static str,
+    message: String,
+) -> VerifyResult {
+    let off = policy_off(policy, &name);
+    let mut action = if off { Action::Warn } else { Action::Fail };
+    let mut findings = vec![Finding {
+        level: if action == Action::Fail {
+            "error"
+        } else {
+            "warn"
+        }
+        .to_string(),
+        message,
+    }];
+
+    apply_markers(marker_msgs, policy, &name, &mut findings, &mut action);
+    VerifyResult {
+        target: target.to_string(),
+        policy_source,
+        name,
+        version: None,
+        kind: None,
+        identity: None,
+        issuer: None,
+        keyid: None,
+        integrated_time: None,
+        format: Some(format.to_string()),
+        root: None,
+        signed: true,
+        action,
+        findings,
+    }
+}
+
+/// Verify a directory signed with OpenSSF Model Signing (`skill.oms.sig` or
+/// `model.sig`) against the user's trust roots, then apply the same policy,
+/// markers, revocation and pins as a PromptSign bundle.
+pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
+    let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (policy, _raw, policy_source) = load_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let abs = std::path::absolute(target).map_err(|e| format!("{target}: {e}"))?;
+
+    if !abs.is_dir() {
+        return Err(format!(
+            "{}: OMS signatures cover directories",
+            abs.display()
+        ));
+    }
+
+    let sig_path = oms::signature_file(&abs)
+        .ok_or_else(|| format!("no OMS signature file in {}", abs.display()))?;
+    let sig_name = basename(&sig_path);
+    let fallback_name = basename(&abs);
+    let marker_msgs = context_marker_messages(&abs, true);
+    let outcome = std::fs::read(&sig_path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()))
+        .and_then(|bundle| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+
+            oms::verify_oms_bundle(&abs, &bundle, &sig_name, &load_registry()?, now)
+        });
+    let out = match outcome {
+        Ok(out) => out,
+        Err(e) => {
+            return Ok(signature_failure(
+                target,
+                &policy,
+                policy_source,
+                &marker_msgs,
+                fallback_name,
+                FORMAT_OMS,
+                format!("invalid signature: {e}"),
+            ))
+        }
+    };
+    let signed = Signed {
+        name: out.name,
+        version: None,
+        kind: Some(out.kind.to_string()),
+        identity: out.signer.identity,
+        issuer: Some(out.signer.issuer),
+        keyid: out.signer.leaf_keyid,
+        root: Some(out.signer.root),
+        integrated_time: out.signer.integrated_time,
+        format: FORMAT_OMS,
+        payload_digest: revocation::payload_digest_of(&out.signer.payload),
+        log_index: out.signer.log_index,
+    };
+
+    finish(
+        target,
+        &policy,
+        policy_source,
+        &marker_msgs,
+        opts,
+        signed,
+        out.findings,
+        out.action,
+    )
 }
 
 #[cfg(test)]
