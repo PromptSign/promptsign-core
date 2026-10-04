@@ -24,6 +24,10 @@
 *.so    binary
 *.dylib binary
 
+# Foreign signature fixtures (OMS, nono) hash raw bytes: store them exactly as
+# signed, with no line-ending conversion in either direction.
+promptsign-core/tests/fixtures/foreign/** -text
+
 # Lockfiles: text, but collapsed in GitHub diffs and review.
 Cargo.lock       linguist-generated
 package-lock.json linguist-generated
