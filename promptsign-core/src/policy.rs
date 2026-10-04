@@ -215,6 +215,20 @@ pub struct EvalOutcome {
 
 /// Evaluate a verified signer against policy. `signed: false` means no bundle
 /// was found at all. Action is the worst outcome across all checks.
+/// The part of an identity a TOFU pin binds (spec/05 §5). A keyless CI
+/// identity is a workflow URI ending in `@refs/...`; every release tag changes
+/// that suffix, so the pin binds the workflow and ignores the ref. Keyful
+/// identities are free-form and compared whole.
+fn pin_identity<'a>(identity: &'a str, issuer: Option<&str>) -> &'a str {
+    if issuer.is_none() || !identity.starts_with("https://") {
+        return identity;
+    }
+    match identity.find("@refs/") {
+        Some(at) => &identity[..at],
+        None => identity,
+    }
+}
+
 pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome {
     let rule = match_rule(policy, input.name);
     let level = rule
@@ -306,8 +320,10 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
     if rule.tofu == Some(true) {
         if let Some(pin) = pins.get(input.name) {
             let issuer_changed = pin.issuer.as_deref().unwrap_or("") != input.issuer.unwrap_or("");
+            let identity_changed = pin_identity(&pin.identity, pin.issuer.as_deref())
+                != pin_identity(identity, input.issuer);
 
-            if pin.identity != identity || pin.keyid != keyid || issuer_changed {
+            if identity_changed || pin.keyid != keyid || issuer_changed {
                 // Pin mismatch is always a hard failure: this is the signal for
                 // account compromise or repo-transfer attacks (T3).
                 let issuer_note = if issuer_changed {
@@ -494,6 +510,89 @@ mod tests {
 
         assert_eq!(changed.action, Action::Fail);
         assert!(changed.findings[0].message.contains("TOFU pin mismatch"));
+    }
+
+    const GHA: &str = "https://token.actions.githubusercontent.com";
+    const SIGN_YML: &str = "https://github.com/acme/skills/.github/workflows/sign.yml";
+
+    fn keyless_input<'a>(identity: &'a str, issuer: &'a str) -> EvalInput<'a> {
+        EvalInput {
+            name: "s",
+            identity: Some(identity),
+            keyid: Some(""),
+            issuer: Some(issuer),
+            signed: true,
+        }
+    }
+
+    fn keyless_pin(identity: &str, issuer: &str) -> Pins {
+        let mut pins = Pins::new();
+
+        pins.insert(
+            "s".into(),
+            Pin {
+                name: "s".into(),
+                identity: identity.into(),
+                keyid: String::new(),
+                issuer: Some(issuer.into()),
+                first_seen: "2026-01-01T00:00:00Z".into(),
+            },
+        );
+        pins
+    }
+
+    #[test]
+    fn keyless_pin_survives_a_new_release_tag_from_the_same_workflow() {
+        let p = default_policy();
+        let pins = keyless_pin(&format!("{SIGN_YML}@refs/tags/v1.0.0"), GHA);
+
+        for next in ["@refs/tags/v1.0.1", "@refs/heads/main"] {
+            let out = evaluate(&p, &keyless_input(&format!("{SIGN_YML}{next}"), GHA), &pins);
+
+            assert_eq!(out.action, Action::Pass, "{next}: {:?}", out.findings);
+            assert!(out.findings.is_empty());
+            assert!(out.pin_update.is_none());
+        }
+    }
+
+    #[test]
+    fn keyless_pin_still_fails_on_another_workflow_repo_or_issuer() {
+        let p = default_policy();
+        let pins = keyless_pin(&format!("{SIGN_YML}@refs/tags/v1.0.0"), GHA);
+        let other_workflow =
+            "https://github.com/acme/skills/.github/workflows/evil.yml@refs/tags/v1.0.1";
+        let other_repo =
+            "https://github.com/evil/skills/.github/workflows/sign.yml@refs/tags/v1.0.1";
+        let same_tag = format!("{SIGN_YML}@refs/tags/v1.0.0");
+
+        for (identity, issuer) in [
+            (other_workflow, GHA),
+            (other_repo, GHA),
+            (same_tag.as_str(), "https://gitlab.com"),
+        ] {
+            let out = evaluate(&p, &keyless_input(identity, issuer), &pins);
+
+            assert_eq!(out.action, Action::Fail, "{identity} via {issuer}");
+            assert!(out.findings[0].message.contains("TOFU pin mismatch"));
+        }
+    }
+
+    #[test]
+    fn ref_suffix_is_ignored_only_for_keyless_workflow_uris() {
+        assert_eq!(
+            pin_identity(&format!("{SIGN_YML}@refs/tags/v1"), Some(GHA)),
+            SIGN_YML
+        );
+        // Email identities keep their '@'.
+        assert_eq!(
+            pin_identity("dev@example.com", Some("https://github.com/login/oauth")),
+            "dev@example.com"
+        );
+        // Keyful identities are free-form and always compared exactly.
+        assert_eq!(
+            pin_identity("https://x@refs/tags/v1", None),
+            "https://x@refs/tags/v1"
+        );
     }
 
     #[test]
