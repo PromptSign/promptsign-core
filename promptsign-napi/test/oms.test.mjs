@@ -11,7 +11,16 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const fixtures = path.join(here, '..', '..', 'promptsign-core', 'tests', 'fixtures', 'foreign', 'oms');
+const fixtures = path.join(
+  here,
+  '..',
+  '..',
+  'promptsign-core',
+  'tests',
+  'fixtures',
+  'foreign',
+  'oms',
+);
 const NVIDIA_FP = '6f1bb875b77aea3fc878a7a3237497235c53657601375c0ef4bdcde69e843782';
 
 // A certificate-mode root in trusted_root.json shape, as `promptsign trust add
@@ -32,12 +41,15 @@ const home = path.join(base, 'home');
 const trust = path.join(home, 'trust');
 mkdirSync(path.join(trust, 'roots'), { recursive: true });
 cpSync(path.join(here, '..', 'trust'), trust, { recursive: true });
-writeFileSync(path.join(trust, 'roots', 'nvidia.json'), JSON.stringify(caRootDoc(path.join(fixtures, 'nvidia-agent-root-cert.pem'))));
+writeFileSync(
+  path.join(trust, 'roots', 'nvidia.json'),
+  JSON.stringify(caRootDoc(path.join(fixtures, 'nvidia-agent-root-cert.pem'))),
+);
 process.env.PROMPTSIGN_HOME = home;
 
 const { verify, trustRoots } = createRequire(import.meta.url)('../index.cjs');
 
-test('trustRoots lists the pinned public root and the user\'s named roots', () => {
+test("trustRoots lists the pinned public root and the user's named roots", () => {
   const roots = trustRoots();
   assert.deepEqual(
     roots.map((r) => [r.name, r.kind]),
@@ -53,7 +65,10 @@ test('an OMS-signed skill verifies with format and root', () => {
   const skill = path.join(base, 'skills', 'earth2studio-discover');
   cpSync(path.join(fixtures, 'nvidia-earth2studio-discover'), skill, { recursive: true });
   const policy = path.join(base, 'policy.json');
-  writeFileSync(policy, JSON.stringify({ schema: 'promptsign/policy/v1', default: 'enforce', rules: [] }));
+  writeFileSync(
+    policy,
+    JSON.stringify({ schema: 'promptsign/policy/v1', default: 'enforce', rules: [] }),
+  );
 
   const r = verify(skill, { policyPath: policy, noPinUpdates: true });
   assert.equal(r.action, 'pass', JSON.stringify(r.findings));

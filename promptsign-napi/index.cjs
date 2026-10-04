@@ -163,4 +163,12 @@ function coreVersion() {
   return native.coreVersion();
 }
 
-module.exports = { verify, verifyTree, verifyKeyless, policyShow, coreVersion, trustRoot, trustRoots };
+module.exports = {
+  verify,
+  verifyTree,
+  verifyKeyless,
+  policyShow,
+  coreVersion,
+  trustRoot,
+  trustRoots,
+};
