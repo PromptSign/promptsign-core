@@ -125,6 +125,17 @@ pub fn iso8601_now() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
 }
 
+/// Epoch seconds as RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`), the inverse of
+/// `parse_iso8601` at whole seconds.
+pub fn format_iso8601(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 /// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.mmm]Z`, the shape
 /// `iso8601_now` and JS `Date.toISOString()` produce) to epoch seconds. Lenient
 /// on the fractional-seconds and trailing `Z`; strict on the date/time layout.

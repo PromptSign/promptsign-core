@@ -22,7 +22,8 @@ pub struct Rule {
     pub issuer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyid: Option<String>,
-    /// Registry root (spec/04) the signature must chain to.
+    /// Glob over the name of the registry root (spec/07) the signature must
+    /// chain to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,6 +52,10 @@ pub struct Policy {
     /// missing. A revoked artifact always fails regardless of this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_feed_stale: Option<String>,
+    /// "warn" (default) or "fail": the weight of a signature anchored at the
+    /// root of an expired trust bundle (spec/07 §5.6). User policy only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_trust_bundle_stale: Option<String>,
 }
 
 pub fn default_policy() -> Policy {
@@ -68,6 +73,7 @@ pub fn default_policy() -> Policy {
         revocation_feed_issuer: None,
         max_feed_staleness: None,
         on_feed_stale: None,
+        on_trust_bundle_stale: None,
     }
 }
 
@@ -368,7 +374,7 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
     if let Some(rule_root) = &rule.trust_root {
         let root = input.root.unwrap_or("");
 
-        if rule_root != root {
+        if !glob_match(rule_root, root) {
             violate(
                 format!(
                     "trust root \"{root}\" not allowed for \"{}\" (expected {rule_root})",
@@ -487,6 +493,7 @@ mod tests {
             revocation_feed_issuer: None,
             max_feed_staleness: None,
             on_feed_stale: None,
+            on_trust_bundle_stale: None,
         }
     }
 
@@ -740,6 +747,35 @@ mod tests {
             evaluate(&p, &input(Some("nvidia")), &Pins::new()).action,
             Action::Pass
         );
+    }
+
+    #[test]
+    fn trust_root_rule_is_a_glob_over_bundle_roots() {
+        let p = policy_with(vec![Rule {
+            pattern: "*".into(),
+            trust_root: Some("acme/*".into()),
+            action: Some("enforce".into()),
+            ..Default::default()
+        }]);
+        let input = |root| EvalInput {
+            root,
+            ..keyless_input("CN=Signing 001", NV_ROOT)
+        };
+
+        for ok in ["acme/prod", "acme/ca"] {
+            assert_eq!(
+                evaluate(&p, &input(Some(ok)), &Pins::new()).action,
+                Action::Pass,
+                "{ok}"
+            );
+        }
+        for bad in ["acme", "acmex/prod", "sigstore-public"] {
+            assert_eq!(
+                evaluate(&p, &input(Some(bad)), &Pins::new()).action,
+                Action::Fail,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -31,8 +31,9 @@ const who = verifyKeyless(bundleJson); // { identity, issuer, keyid, root }
 const policy = policyShow('.');
 
 // Every trust root a signature may chain to: the pinned public Sigstore root,
-// then roots added with `promptsign trust add` (~/.promptsign/trust/roots).
-const roots = trustRoots(); // [{ name, kind, fingerprint, subject }]
+// roots added with `promptsign trust add` (~/.promptsign/trust/roots), then
+// the roots of installed trust bundles, named <bundle>/<root>.
+const roots = trustRoots(); // [{ name, kind, fingerprint, subject, expires? }]
 
 coreVersion(); // the wrapped promptsign-core version
 ```

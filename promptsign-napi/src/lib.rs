@@ -84,21 +84,28 @@ pub fn policy_show(dir: String) -> Result<String> {
     serde_json::to_string(&raw).map_err(|e| err(e.to_string()))
 }
 
-/// Every trust root the verifier accepts: the pinned public root, then the
-/// user's named roots (`promptsign trust add`). JSON array of
-/// `{ name, kind, fingerprint, subject }`, kind "keyless" or "certificate".
+/// Every trust root the verifier accepts: the pinned public root, the user's
+/// named roots (`promptsign trust add`), then the roots of installed trust
+/// bundles, named `<bundle>/<root>`. JSON array of
+/// `{ name, kind, fingerprint, subject, expires? }`, kind "keyless" or
+/// "certificate"; `expires` is a bundle root's bundle expiry (RFC 3339).
 #[napi]
 pub fn trust_roots() -> Result<String> {
     let roots = promptsign_core::trustroot::load_registry().map_err(err)?;
     let out: Vec<serde_json::Value> = roots
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut root = serde_json::json!({
                 "name": r.name,
                 "kind": if r.is_ca_only() { "certificate" } else { "keyless" },
                 "fingerprint": r.fingerprint,
                 "subject": r.subject,
-            })
+            });
+
+            if let Some(t) = r.expires {
+                root["expires"] = promptsign_core::util::format_iso8601(t).into();
+            }
+            root
         })
         .collect();
 

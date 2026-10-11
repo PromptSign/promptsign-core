@@ -12,7 +12,7 @@
 use crate::bundle::pae;
 use crate::chain::{
     anchor_chain, check_signing_leaf, check_valid_at, spki_der_of, subject_of,
-    verify_leaf_signature,
+    verify_leaf_signature, Anchored,
 };
 use crate::keyless::{verify_keyless_parts, TlogEntry};
 use crate::trustroot::{b64_to_hex, load_registry, Root};
@@ -139,7 +139,7 @@ pub fn verify_sigstore_bundle(
 
     for a in &anchored {
         let attempt = if a.root.is_ca_only() {
-            verify_certificate_mode(&chain, &a.path, &payload_type, &payload, sig_b64, now)
+            verify_certificate_mode(&chain, a, &payload_type, &payload, sig_b64, now)
         } else {
             verify_keyless_mode(bundle, &chain, &payload_type, &payload, sig_b64, a.root)
         };
@@ -173,15 +173,25 @@ type ModeResult = Result<(SignerMode, String, String, Option<i64>, Option<i64>)>
 
 fn verify_certificate_mode(
     chain: &[Certificate],
-    path: &[Certificate],
+    anchored: &Anchored,
     payload_type: &str,
     payload: &[u8],
     sig_b64: &str,
     now: i64,
 ) -> ModeResult {
     let leaf = &chain[0];
+    let ca = anchored.path.last().ok_or("empty certificate path")?;
 
-    check_valid_at(path, now)?;
+    check_valid_at(&anchored.path, now)?;
+    // No log witnessed a certificate-mode signature, so the CA's window is
+    // checked at the current time, like the certificates (spec/07 §3.2).
+    if !anchored.root.ca_valid_at(ca, now) {
+        return Err(format!(
+            "certificate authority \"{}\" of trust root \"{}\" is outside its validity window",
+            subject_of(ca),
+            anchored.root.name
+        ));
+    }
     check_signing_leaf(leaf)?;
 
     let sig = BASE64_STANDARD

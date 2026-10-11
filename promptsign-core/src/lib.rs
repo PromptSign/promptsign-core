@@ -16,6 +16,7 @@ pub mod oms;
 pub mod policy;
 pub mod revocation;
 pub mod sigstore_bundle;
+pub mod trustbundle;
 pub mod trustroot;
 pub mod util;
 pub mod verify;

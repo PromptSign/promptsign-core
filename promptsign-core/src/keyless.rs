@@ -3,8 +3,8 @@
 // extraction, Rekor signed-entry-timestamp check. No network anywhere.
 
 use crate::bundle::pae;
-use crate::chain::{anchor_chain, spki_der_of, verify_leaf_signature, Anchored};
-use crate::trustroot::{load_registry, Root};
+use crate::chain::{anchor_chain, spki_der_of, subject_of, verify_leaf_signature, Anchored};
+use crate::trustroot::{load_registry, Root, Window};
 use crate::util::{promptsign_home, sha256_hex};
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -34,6 +34,9 @@ pub struct RekorLog {
     pub key: p256::ecdsa::VerifyingKey,
     pub log_id: String,
     pub spki_der: Vec<u8>,
+    /// When the key may have witnessed entries (spec/07 §4). Open for the
+    /// pinned `rekor.pub`, which carries no windows.
+    pub valid: Window,
 }
 
 impl RekorLog {
@@ -45,6 +48,7 @@ impl RekorLog {
             key,
             log_id: sha256_hex(der),
             spki_der: der.to_vec(),
+            valid: Window::default(),
         })
     }
 }
@@ -233,6 +237,28 @@ pub(crate) fn keyless_roots() -> Result<Vec<Root>> {
     Ok(roots)
 }
 
+/// The validity windows of spec/07 §4 at the log's integratedTime: the CA the
+/// chain ends at, under any of its entries, and the log key that witnessed it.
+fn check_windows(a: &Anchored, log: &RekorLog, t: i64) -> Result<()> {
+    let ca = a.path.last().ok_or("empty certificate path")?;
+
+    if !a.root.ca_valid_at(ca, t) {
+        return Err(format!(
+            "certificate authority \"{}\" of trust root \"{}\" was outside its validity window when the log witnessed the signature (integratedTime {t})",
+            subject_of(ca),
+            a.root.name
+        ));
+    }
+    if !log.valid.contains(t) {
+        return Err(format!(
+            "transparency log {}… of trust root \"{}\" was outside its validity window at integratedTime {t}",
+            &log.log_id[..16.min(log.log_id.len())],
+            a.root.name
+        ));
+    }
+    Ok(())
+}
+
 /// Offline keyless verification per spec/05-keyless.md §4, independent of
 /// how the bundle carries its parts: the chain must end at a keyless root,
 /// the leaf must have signed the DSSE envelope, and one of that root's logs
@@ -260,12 +286,21 @@ pub(crate) fn verify_keyless_parts(
     // witnessed it; pick that log's key from a root the chain ends at. After a
     // key rotation both keys are pinned, so old entries keep verifying.
     let mut found: Option<(&Anchored, &RekorLog)> = None;
+    let mut window_error = None;
 
     for a in &anchored {
         if let Some(log) = a.root.rekor_logs.iter().find(|l| l.log_id == tlog.log_id) {
-            found = Some((a, log));
-            break;
+            match check_windows(a, log, tlog.integrated_time) {
+                Ok(()) => {
+                    found = Some((a, log));
+                    break;
+                }
+                Err(e) => window_error = window_error.or(Some(e)),
+            }
         }
+    }
+    if let (None, Some(e)) = (found, window_error) {
+        return Err(e);
     }
 
     let (anchor, log) = found.ok_or_else(|| {
@@ -359,7 +394,11 @@ pub(crate) fn verify_keyless_parts(
 /// registry. Returns the authenticated payload; manifest parsing, integrity
 /// and policy are the caller's next steps.
 pub fn verify_keyless(bundle: &Value) -> Result<KeylessVerification> {
-    let roots = keyless_roots()?;
+    verify_keyless_with(bundle, &keyless_roots()?)
+}
+
+/// `verify_keyless` against the given roots instead of the registry.
+pub fn verify_keyless_with(bundle: &Value, roots: &[Root]) -> Result<KeylessVerification> {
     let chain_b64 = bundle
         .get("signer")
         .and_then(|s| s.get("certChain"))
@@ -407,7 +446,7 @@ pub fn verify_keyless(bundle: &Value) -> Result<KeylessVerification> {
         set_b64: str_at(t, &["signedEntryTimestamp"])
             .ok_or("transparency.signedEntryTimestamp missing")?,
     };
-    let parts = verify_keyless_parts(&chain, payload_type, &payload, sig_b64, &tlog, &roots)?;
+    let parts = verify_keyless_parts(&chain, payload_type, &payload, sig_b64, &tlog, roots)?;
 
     // display-hint check (step 6)
     if let Some(hint) = str_at(bundle, &["signer", "identity"]) {

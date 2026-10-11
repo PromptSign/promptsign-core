@@ -12,7 +12,9 @@ use crate::policy::{
     EffectivePolicy, EvalInput, Finding, Pins, Policy,
 };
 use crate::revocation::{self, Subject};
+use crate::trustbundle::installed_user_bundles;
 use crate::trustroot::load_registry;
+use crate::util::format_iso8601;
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use serde::Serialize;
@@ -463,6 +465,17 @@ fn finish(
         }
     }
 
+    if let Some(root) = signed.root.as_deref() {
+        if let Some(f) = stale_bundle_finding(policy, root)? {
+            if f.level == "error" {
+                action = Action::Fail;
+            } else if action < Action::Warn {
+                action = Action::Warn;
+            }
+            findings.push(f);
+        }
+    }
+
     if action != Action::Fail && !opts.no_pin_updates {
         if let Some(pin) = out.pin_update {
             findings.push(Finding {
@@ -493,6 +506,35 @@ fn finish(
         action,
         findings,
     })
+}
+
+/// A root from a trust bundle past its expiry still verifies, with a finding
+/// whose weight the user policy sets (spec/07 §5.6). Only bundle roots, named
+/// `<bundle>/<root>`, can be stale.
+fn stale_bundle_finding(policy: &Policy, root: &str) -> Result<Option<Finding>> {
+    let Some((bundle, _)) = root.split_once('/') else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let stale = installed_user_bundles(now)?
+        .into_iter()
+        .find(|i| i.bundle.name == bundle && i.stale);
+
+    Ok(stale.map(|i| Finding {
+        level: if policy.on_trust_bundle_stale.as_deref() == Some("fail") {
+            "error"
+        } else {
+            "warn"
+        }
+        .to_string(),
+        message: format!(
+            "trust bundle \"{bundle}\" expired at {}: run \"promptsign trust fetch\" to refresh it",
+            format_iso8601(i.bundle.expires)
+        ),
+    }))
 }
 
 /// A signature that does not verify is never silently ignored: at least a

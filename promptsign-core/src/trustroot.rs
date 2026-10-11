@@ -9,7 +9,8 @@
 
 use crate::chain::{is_self_signed, subject_of};
 use crate::keyless::{parse_rekor_logs, trust_dir, RekorLog};
-use crate::util::{hex, promptsign_home, sha256_hex};
+use crate::trustbundle::installed_in;
+use crate::util::{format_iso8601, hex, parse_iso8601, promptsign_home, sha256_hex};
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use der::{Decode, Encode};
@@ -22,12 +23,66 @@ pub const DEFAULT_ROOT: &str = "sigstore-public";
 pub const TRUSTED_ROOT_MEDIA_TYPE: &str =
     "application/vnd.dev.sigstore.trustedroot+json;version=0.1";
 
+/// A `validFor` window, `[start, end)` in Unix seconds (spec/07 §4). A
+/// missing side is open, and a missing window is always valid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Window {
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+}
+
+impl Window {
+    pub fn contains(&self, t: i64) -> bool {
+        !matches!(self.start, Some(s) if t < s) && !matches!(self.end, Some(e) if t >= e)
+    }
+
+    fn from_json(v: &Value) -> Result<Window> {
+        let side = |key: &str| -> Result<Option<i64>> {
+            match v.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(t) => t
+                    .as_str()
+                    .and_then(parse_iso8601)
+                    .map(Some)
+                    .ok_or_else(|| format!("validFor.{key} is not an RFC 3339 time: {t}")),
+            }
+        };
+
+        if v.is_null() {
+            return Ok(Window::default());
+        }
+        Ok(Window {
+            start: side("start")?,
+            end: side("end")?,
+        })
+    }
+
+    fn to_json(self) -> Option<Value> {
+        if self == Window::default() {
+            return None;
+        }
+
+        let mut out = serde_json::Map::new();
+
+        if let Some(s) = self.start {
+            out.insert("start".into(), json!(format_iso8601(s)));
+        }
+        if let Some(e) = self.end {
+            out.insert("end".into(), json!(format_iso8601(e)));
+        }
+        Some(Value::Object(out))
+    }
+}
+
 #[derive(Clone)]
 pub struct Root {
     pub name: String,
     /// Pinned CA certificates: intermediates and the anchor. Any of them may
     /// terminate a chain.
     pub ca_certs: Vec<Certificate>,
+    /// The validity window of each entry in `ca_certs`, index for index. A
+    /// certificate listed under several CA entries appears once per entry.
+    pub ca_valid: Vec<Window>,
     /// Transparency logs whose entries this root accepts. Empty for a
     /// certificate-mode root.
     pub rekor_logs: Vec<RekorLog>,
@@ -35,10 +90,17 @@ pub struct Root {
     pub fingerprint: String,
     /// Subject DN of the anchor certificate.
     pub subject: String,
+    /// For a root from a trust bundle, that bundle's expiry (spec/07 §5.6).
+    pub expires: Option<i64>,
 }
 
 impl Root {
-    fn new(name: &str, ca_certs: Vec<Certificate>, rekor_logs: Vec<RekorLog>) -> Result<Root> {
+    fn new(
+        name: &str,
+        ca_certs: Vec<Certificate>,
+        ca_valid: Vec<Window>,
+        rekor_logs: Vec<RekorLog>,
+    ) -> Result<Root> {
         if ca_certs.is_empty() {
             return Err(format!("trust root \"{name}\": no CA certificates"));
         }
@@ -56,7 +118,9 @@ impl Root {
             fingerprint: sha256_hex(&der),
             subject: subject_of(anchor),
             ca_certs,
+            ca_valid,
             rekor_logs,
+            expires: None,
         })
     }
 
@@ -64,30 +128,35 @@ impl Root {
     pub fn from_pem(name: &str, fulcio_pem: &[u8], rekor_pem: &str) -> Result<Root> {
         let ca_certs =
             Certificate::load_pem_chain(fulcio_pem).map_err(|e| format!("CA certificates: {e}"))?;
+        let ca_valid = vec![Window::default(); ca_certs.len()];
 
-        Root::new(name, ca_certs, parse_rekor_logs(rekor_pem)?)
+        Root::new(name, ca_certs, ca_valid, parse_rekor_logs(rekor_pem)?)
     }
 
     /// A certificate-mode root from one or more PEM CA certificates.
     pub fn ca_only(name: &str, ca_pem: &[u8]) -> Result<Root> {
         let ca_certs =
             Certificate::load_pem_chain(ca_pem).map_err(|e| format!("CA certificate: {e}"))?;
+        let ca_valid = vec![Window::default(); ca_certs.len()];
 
-        Root::new(name, ca_certs, Vec::new())
+        Root::new(name, ca_certs, ca_valid, Vec::new())
     }
 
-    /// A root from a Sigstore `trusted_root.json` document. Logs whose key is
-    /// not ECDSA P-256 (Rekor v2's Ed25519 logs) are skipped: their entries
-    /// carry no signed entry timestamp this verifier can check. CA validity
-    /// windows (`validFor`) are not enforced yet.
+    /// A root from a Sigstore `trusted_root.json` document (spec/07 §1).
+    /// Logs whose key is not ECDSA P-256 (Rekor v2's Ed25519 logs) are
+    /// skipped: their entries carry no signed entry timestamp this verifier
+    /// can check. So is a log whose stated id is not its key's.
     pub fn from_trusted_root(name: &str, doc: &Value) -> Result<Root> {
         let mut ca_certs = Vec::new();
+        let mut ca_valid = Vec::new();
 
         for ca in doc["certificateAuthorities"]
             .as_array()
             .into_iter()
             .flatten()
         {
+            let window = Window::from_json(&ca["validFor"])?;
+
             for c in ca["certChain"]["certificates"]
                 .as_array()
                 .into_iter()
@@ -104,6 +173,7 @@ impl Root {
                 ca_certs.push(
                     Certificate::from_der(&der).map_err(|e| format!("certificate parse: {e}"))?,
                 );
+                ca_valid.push(window);
             }
         }
 
@@ -123,45 +193,86 @@ impl Root {
                         .ok_or("log key without rawBytes")?,
                 )
                 .map_err(|_| "invalid base64 in log key rawBytes")?;
+            let mut rekor = RekorLog::from_spki_der(&der)?;
 
-            rekor_logs.push(RekorLog::from_spki_der(&der)?);
+            if let Some(stated) = log["logId"]["keyId"].as_str() {
+                if b64_to_hex(stated)? != rekor.log_id {
+                    continue;
+                }
+            }
+            rekor.valid = Window::from_json(&log["publicKey"]["validFor"])?;
+            rekor_logs.push(rekor);
         }
 
-        Root::new(name, ca_certs, rekor_logs)
+        Root::new(name, ca_certs, ca_valid, rekor_logs)
     }
 
-    /// This root as a `trusted_root.json` document.
+    /// This root as a `trusted_root.json` document. Consecutive certificates
+    /// with the same window share one CA entry.
     pub fn to_trusted_root(&self) -> Value {
         let tlogs: Vec<Value> = self
             .rekor_logs
             .iter()
             .map(|l| {
+                let mut public_key = json!({
+                    "rawBytes": BASE64_STANDARD.encode(&l.spki_der),
+                    "keyDetails": "PKIX_ECDSA_P256_SHA_256"
+                });
+
+                if let Some(w) = l.valid.to_json() {
+                    public_key["validFor"] = w;
+                }
                 json!({
                     "hashAlgorithm": "SHA2_256",
-                    "publicKey": {
-                        "rawBytes": BASE64_STANDARD.encode(&l.spki_der),
-                        "keyDetails": "PKIX_ECDSA_P256_SHA_256"
-                    },
+                    "publicKey": public_key,
                     "logId": { "keyId": BASE64_STANDARD.encode(hex_decode(&l.log_id)) }
                 })
             })
             .collect();
-        let certificates: Vec<Value> = self
-            .ca_certs
-            .iter()
-            .map(|c| json!({ "rawBytes": BASE64_STANDARD.encode(c.to_der().unwrap_or_default()) }))
+        let mut groups: Vec<(Window, Vec<Value>)> = Vec::new();
+
+        for (c, w) in self.ca_certs.iter().zip(&self.ca_valid) {
+            let raw = json!({ "rawBytes": BASE64_STANDARD.encode(c.to_der().unwrap_or_default()) });
+
+            match groups.last_mut() {
+                Some((last, certs)) if last == w => certs.push(raw),
+                _ => groups.push((*w, vec![raw])),
+            }
+        }
+
+        let authorities: Vec<Value> = groups
+            .into_iter()
+            .map(|(w, certificates)| {
+                let mut ca = json!({
+                    "subject": { "commonName": self.subject },
+                    "certChain": { "certificates": certificates }
+                });
+
+                if let Some(w) = w.to_json() {
+                    ca["validFor"] = w;
+                }
+                ca
+            })
             .collect();
 
         json!({
             "mediaType": TRUSTED_ROOT_MEDIA_TYPE,
             "tlogs": tlogs,
-            "certificateAuthorities": [{
-                "subject": { "commonName": self.subject },
-                "certChain": { "certificates": certificates }
-            }],
+            "certificateAuthorities": authorities,
             "ctlogs": [],
             "timestampAuthorities": []
         })
+    }
+
+    /// Whether `cert`, a CA of this root, was valid at `t` under any of the
+    /// CA entries that list it.
+    pub(crate) fn ca_valid_at(&self, cert: &Certificate, t: i64) -> bool {
+        let der = cert.to_der().ok();
+
+        self.ca_certs
+            .iter()
+            .zip(&self.ca_valid)
+            .any(|(c, w)| c.to_der().ok() == der && w.contains(t))
     }
 
     pub fn is_ca_only(&self) -> bool {
@@ -187,11 +298,11 @@ pub(crate) fn b64_to_hex(s: &str) -> Result<String> {
         .map_err(|_| "invalid base64".to_string())
 }
 
-fn roots_dir(dir: &Path) -> PathBuf {
+pub(crate) fn roots_dir(dir: &Path) -> PathBuf {
     dir.join("roots")
 }
 
-fn check_name(name: &str) -> Result<()> {
+pub(crate) fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && !name.starts_with('.')
@@ -217,26 +328,41 @@ pub fn user_trust_dir() -> PathBuf {
     promptsign_home().join("trust")
 }
 
-/// Every root the user trusts: the pinned public root from the trust
-/// directory, then the user's named roots.
+/// Every root the user trusts (spec/07 §2): the pinned public root from the
+/// trust directory, the user's named roots, then the roots of each installed
+/// trust bundle.
 pub fn load_registry() -> Result<Vec<Root>> {
-    let mut roots: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
+    let pinned: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
 
-    roots.extend(load_named(&roots_dir(&user_trust_dir()))?);
-    Ok(roots)
+    registry(&user_trust_dir(), pinned)
 }
 
 /// Every root in `dir`: the built-in pinned pair first (when present), then
-/// `roots/*.json` by name. A root file that does not parse is an error, not
-/// a silent skip.
+/// `roots/*.json` by name, then bundle roots. A root file that does not
+/// parse, or a stored bundle that does not verify, is an error, not a silent
+/// skip.
 pub fn load_registry_from(dir: &Path) -> Result<Vec<Root>> {
-    let mut roots: Vec<Root> = load_pinned(dir)?.into_iter().collect();
+    let pinned: Vec<Root> = load_pinned(dir)?.into_iter().collect();
 
-    roots.extend(load_named(&roots_dir(dir))?);
+    registry(dir, pinned)
+}
+
+fn registry(dir: &Path, pinned: Vec<Root>) -> Result<Vec<Root>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let bundles = installed_in(dir, &pinned, now)?;
+    let mut roots = pinned;
+
+    roots.extend(load_named_in(&roots_dir(dir))?);
+    for installed in bundles {
+        roots.extend(installed.bundle.roots);
+    }
     Ok(roots)
 }
 
-fn load_pinned(dir: &Path) -> Result<Option<Root>> {
+pub(crate) fn load_pinned(dir: &Path) -> Result<Option<Root>> {
     let fulcio = dir.join("fulcio.pem");
     let rekor = dir.join("rekor.pub");
 
@@ -252,7 +378,7 @@ fn load_pinned(dir: &Path) -> Result<Option<Root>> {
         .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-fn load_named(rdir: &Path) -> Result<Vec<Root>> {
+pub(crate) fn load_named_in(rdir: &Path) -> Result<Vec<Root>> {
     let mut roots = Vec::new();
 
     if !rdir.is_dir() {

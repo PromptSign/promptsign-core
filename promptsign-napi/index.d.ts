@@ -52,6 +52,10 @@ export interface RegistryRoot {
   /** Hex SHA-256 of the anchor certificate. */
   fingerprint: string;
   subject: string;
+  /** For a trust bundle's root (named `<bundle>/<root>`), the bundle's
+   * expiry (RFC 3339). Past it, the bundle is stale until `promptsign trust
+   * fetch` refreshes it. */
+  expires?: string;
 }
 
 /** Verify one target (directory or file). Mirrors `promptsign verify --json`. */
@@ -68,8 +72,9 @@ export function verifyKeyless(bundle: object | string): KeylessInfo;
  * `.promptsign/policy.json` in `dir` can only tighten it. */
 export function policyShow(dir: string): unknown;
 
-/** Every trust root the verifier accepts: the pinned public root, then the
- * user's named roots from `~/.promptsign/trust/roots`. */
+/** Every trust root the verifier accepts: the pinned public root, the user's
+ * named roots from `~/.promptsign/trust/roots`, then the roots of installed
+ * trust bundles. */
 export function trustRoots(): RegistryRoot[];
 
 /** The wrapped promptsign-core version. */
