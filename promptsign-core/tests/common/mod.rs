@@ -67,6 +67,12 @@ impl MockSigstore {
     /// A deployment whose keys derive from `seed`, so two seeds are two
     /// unrelated deployments.
     pub fn new(seed: u8, cn: &str) -> MockSigstore {
+        MockSigstore::new_valid(seed, cn, now(), now() + 3600 * 24 * 365)
+    }
+
+    /// As `new`, with the CA certificate valid over `[not_before, not_after]`
+    /// (Unix seconds), so fixtures written today still verify years later.
+    pub fn new_valid(seed: u8, cn: &str, not_before: i64, not_after: i64) -> MockSigstore {
         let ca_key = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
         let ca_name = Name::from_str(&format!("CN={cn},O=promptsign tests")).unwrap();
         let ca_spki = SubjectPublicKeyInfoOwned::from_der(
@@ -80,7 +86,7 @@ impl MockSigstore {
         let ca_cert = CertificateBuilder::new(
             Profile::Root,
             SerialNumber::from(1u32),
-            Validity::from_now(Duration::from_secs(3600 * 24 * 365)).unwrap(),
+            validity(not_before, not_after),
             ca_name.clone(),
             ca_spki,
             &ca_key,
@@ -149,6 +155,18 @@ impl MockSigstore {
 
     /// A keyless PromptSign bundle over `payload`, witnessed now.
     pub fn sign_payload(&self, payload: &[u8], identity: &str, issuer: &str) -> Value {
+        self.sign_payload_at(payload, identity, issuer, now())
+    }
+
+    /// As `sign_payload`, witnessed at `integrated_time`. The leaf is valid
+    /// for ten minutes from a minute before it, as Fulcio issues them.
+    pub fn sign_payload_at(
+        &self,
+        payload: &[u8],
+        identity: &str,
+        issuer: &str,
+        integrated_time: i64,
+    ) -> Value {
         let serial = self.serial.get();
 
         self.serial.set(serial + 1);
@@ -169,7 +187,7 @@ impl MockSigstore {
                 enable_key_encipherment: false,
             },
             SerialNumber::from(serial),
-            Validity::from_now(Duration::from_secs(600)).unwrap(),
+            validity(integrated_time - 60, integrated_time + 600),
             Name::from_str("CN=sigstore-intermediate").unwrap(),
             leaf_spki,
             &self.ca_key,
@@ -198,7 +216,6 @@ impl MockSigstore {
             }
         });
         let body_b64 = BASE64_STANDARD.encode(serde_json::to_vec(&body).unwrap());
-        let integrated_time = now();
         let log_id = self.log_id();
         let canonical = format!(
             "{{\"body\":{},\"integratedTime\":{integrated_time},\"logID\":{},\"logIndex\":{serial}}}",
@@ -236,6 +253,18 @@ impl MockSigstore {
     /// A sidecar (`<file>.psig.json`) for a single file's bytes, as
     /// `promptsign sign <file>` writes it.
     pub fn sign_file(&self, file_name: &str, bytes: &[u8], identity: &str, issuer: &str) -> Value {
+        self.sign_file_at(file_name, bytes, identity, issuer, now())
+    }
+
+    /// As `sign_file`, witnessed at `integrated_time`.
+    pub fn sign_file_at(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+        identity: &str,
+        issuer: &str,
+        integrated_time: i64,
+    ) -> Value {
         let manifest = json!({
             "schema": "promptsign/manifest/v1",
             "name": file_name,
@@ -243,7 +272,23 @@ impl MockSigstore {
             "files": [{ "path": file_name, "sha256": sha256_hex(bytes) }]
         });
 
-        self.sign_payload(&serde_json::to_vec(&manifest).unwrap(), identity, issuer)
+        self.sign_payload_at(
+            &serde_json::to_vec(&manifest).unwrap(),
+            identity,
+            issuer,
+            integrated_time,
+        )
+    }
+}
+
+fn validity(not_before: i64, not_after: i64) -> Validity {
+    let at = |t: i64| {
+        x509_cert::time::Time::try_from(UNIX_EPOCH + Duration::from_secs(t as u64)).unwrap()
+    };
+
+    Validity {
+        not_before: at(not_before),
+        not_after: at(not_after),
     }
 }
 
