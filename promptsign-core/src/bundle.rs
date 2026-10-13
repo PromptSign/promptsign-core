@@ -119,6 +119,9 @@ pub struct VerifiedEnvelope {
     pub issuer: Option<String>,
     /// Registry root the keyless chain ended at; absent for keyful bundles.
     pub root: Option<String>,
+    /// When a keyless signature was made (spec/05 §4 step 5); absent for
+    /// keyful bundles.
+    pub signed_at: Option<i64>,
 }
 
 /// Cryptographic verification only — integrity against disk and trust policy
@@ -150,6 +153,7 @@ pub fn verify_envelope(bundle: &Value) -> Result<VerifiedEnvelope> {
             keyid: kv.leaf_keyid,
             issuer: Some(kv.issuer),
             root: Some(kv.root),
+            signed_at: Some(kv.signed_at),
         });
     }
     if str_at(bundle, &["signer", "scheme"]) != Some("ed25519") {
@@ -206,6 +210,7 @@ pub fn verify_envelope(bundle: &Value) -> Result<VerifiedEnvelope> {
         keyid,
         issuer: None,
         root: None,
+        signed_at: None,
     })
 }
 

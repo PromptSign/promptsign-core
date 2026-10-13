@@ -58,14 +58,6 @@ pub struct VerifyResult {
     pub findings: Vec<Finding>,
 }
 
-/// The Rekor integration time stapled in an authenticated bundle, if present.
-/// Only meaningful after `verify_envelope` succeeds (transparency was checked).
-fn integrated_time_of(bundle_value: &Value) -> Option<i64> {
-    bundle_value
-        .pointer("/transparency/integratedTime")
-        .and_then(|v| v.as_i64())
-}
-
 fn basename(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -79,6 +71,7 @@ fn revocation_subject<'a>(
     bundle_value: &Value,
     identity: &'a str,
     issuer: Option<&'a str>,
+    signed_at: Option<i64>,
 ) -> Subject<'a> {
     let payload = BASE64_STANDARD
         .decode(
@@ -96,9 +89,7 @@ fn revocation_subject<'a>(
         log_index: bundle_value
             .pointer("/transparency/logIndex")
             .and_then(|v| v.as_i64()),
-        integrated_time: bundle_value
-            .pointer("/transparency/integratedTime")
-            .and_then(|v| v.as_i64()),
+        integrated_time: signed_at,
     }
 }
 
@@ -311,7 +302,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         action = Action::Fail;
     }
 
-    let subject = revocation_subject(&bundle_value, "", None);
+    let subject = revocation_subject(&bundle_value, "", None, envelope.signed_at);
     let signed = Signed {
         name: manifest.name,
         version: manifest.version,
@@ -320,7 +311,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         issuer: envelope.issuer,
         keyid: envelope.keyid,
         root: envelope.root,
-        integrated_time: integrated_time_of(&bundle_value),
+        integrated_time: envelope.signed_at,
         format: FORMAT_PROMPTSIGN,
         payload_digest: subject.payload_digest,
         log_index: subject.log_index,

@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod v2;
+
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use ed25519_dalek::pkcs8::EncodePublicKey as _;
 use ed25519_dalek::Signer as _;
@@ -29,7 +31,7 @@ use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use x509_cert::Certificate;
 
-struct IssuerExt(String);
+pub(crate) struct IssuerExt(pub String);
 
 impl AssociatedOid for IssuerExt {
     const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57264.1.8");
@@ -61,13 +63,22 @@ pub struct MockSigstore {
     pub ca_cert: Certificate,
     log_key: p256::ecdsa::SigningKey,
     serial: std::cell::Cell<u32>,
+    /// Rekor v2: an Ed25519 log that signs checkpoints.
+    log2_key: ed25519_dalek::SigningKey,
+    /// An RFC 3161 timestamp authority: its own root, and the
+    /// timestamping certificate that root issued.
+    tsa_root_cert: Certificate,
+    tsa_key: p256::ecdsa::SigningKey,
+    pub tsa_cert: Certificate,
 }
 
 impl MockSigstore {
     /// A deployment whose keys derive from `seed`, so two seeds are two
-    /// unrelated deployments.
+    /// unrelated deployments. Its CA is valid 2025 to 2125: a fixed window, so
+    /// two calls with one seed build the same certificate even when a second
+    /// ticks between them.
     pub fn new(seed: u8, cn: &str) -> MockSigstore {
-        MockSigstore::new_valid(seed, cn, now(), now() + 3600 * 24 * 365)
+        MockSigstore::new_valid(seed, cn, 1_735_689_600, 4_891_363_200)
     }
 
     /// As `new`, with the CA certificate valid over `[not_before, not_after]`
@@ -95,6 +106,8 @@ impl MockSigstore {
         .build::<p256::ecdsa::DerSignature>()
         .unwrap();
         let log_key = p256::ecdsa::SigningKey::from_slice(&[seed.wrapping_add(1); 32]).unwrap();
+        let (tsa_root_cert, tsa_key, tsa_cert) =
+            v2::timestamp_authority(seed, cn, not_before, not_after);
 
         MockSigstore {
             ca_key,
@@ -102,6 +115,10 @@ impl MockSigstore {
             ca_cert,
             log_key,
             serial: std::cell::Cell::new(2),
+            log2_key: ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(2); 32]),
+            tsa_root_cert,
+            tsa_key,
+            tsa_cert,
         }
     }
 
@@ -281,7 +298,7 @@ impl MockSigstore {
     }
 }
 
-fn validity(not_before: i64, not_after: i64) -> Validity {
+pub(crate) fn validity(not_before: i64, not_after: i64) -> Validity {
     let at = |t: i64| {
         x509_cert::time::Time::try_from(UNIX_EPOCH + Duration::from_secs(t as u64)).unwrap()
     };
@@ -292,11 +309,15 @@ fn validity(not_before: i64, not_after: i64) -> Validity {
     }
 }
 
-/// A fresh directory under the system temp dir.
+/// A fresh directory under the system temp dir. The counter keeps names
+/// apart when parallel tests read the same clock tick.
 pub fn temp_dir(tag: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let dir = std::env::temp_dir().join(format!(
-        "ps-{tag}-{}-{}",
+        "ps-{tag}-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

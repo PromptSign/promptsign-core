@@ -1,7 +1,9 @@
-// Writes the shared trust-root fixtures (spec/07 §6) that every implementation
-// runs its conformance checks on. Ignored by default; regenerate with
+// Writes the shared trust-root and Rekor v2 fixtures (spec/07 §6) that every
+// implementation runs its conformance checks on. Ignored by default;
+// regenerate with
 //
 //   PROMPTSIGN_FIXTURES_OUT=../../spec/test/fixtures/trust-roots \
+//   PROMPTSIGN_REKOR_V2_FIXTURES_OUT=../../spec/test/fixtures/rekor-v2 \
 //     cargo test --test conformance_fixtures -- --ignored
 //
 // Every certificate, log entry and bundle carries a fixed time, and the mock's
@@ -10,8 +12,12 @@
 
 mod common;
 
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use common::v2::checkpoint;
 use common::{temp_dir, MockSigstore};
+use promptsign_core::keyless::verify_keyless_with;
 use promptsign_core::trustbundle::{check_trust_bundle, store_trust_bundle};
+use promptsign_core::trustroot::Root;
 use promptsign_core::util::parse_iso8601;
 use serde_json::{json, Value};
 use std::fs;
@@ -191,4 +197,166 @@ fn write_trust_root_fixtures() {
         &old(),
         "2026-08-01T00:00:00Z",
     );
+}
+
+/// acme's Rekor v2 deployment: a CA, a Rekor v1 log, an Ed25519 Rekor v2 log
+/// and a timestamp authority.
+fn v2() -> MockSigstore {
+    MockSigstore::new_valid(
+        50,
+        "acme v2",
+        at("2026-01-01T00:00:00Z"),
+        at("2126-01-01T00:00:00Z"),
+    )
+}
+
+/// One Rekor v2 fixture: a file, its sidecar, and whether it verifies.
+struct Case {
+    file: &'static str,
+    sidecar: Value,
+    verifies: bool,
+}
+
+#[test]
+#[ignore = "writes fixtures; run with PROMPTSIGN_REKOR_V2_FIXTURES_OUT set"]
+fn write_rekor_v2_fixtures() {
+    let out = std::env::var_os("PROMPTSIGN_REKOR_V2_FIXTURES_OUT")
+        .map(std::path::PathBuf::from)
+        .expect("set PROMPTSIGN_REKOR_V2_FIXTURES_OUT to the fixture directory");
+    let d = v2();
+    let signed = at("2026-10-01T12:00:00Z");
+    let doc = d.trusted_root_v2();
+    let root = Root::from_trusted_root("acme-v2", &doc).unwrap();
+    let body = |file: &str| format!("{file}: signed through acme's Rekor v2 log\n");
+    let v2_signed =
+        |file: &str| d.sign_file_v2_at(file, body(file).as_bytes(), ALICE, ACME_SSO, signed);
+    let sig_of = |s: &Value| {
+        BASE64_STANDARD
+            .decode(s["envelope"]["signatures"][0]["sig"].as_str().unwrap())
+            .unwrap()
+    };
+    let mut cases = Vec::new();
+
+    cases.push(Case {
+        file: "signed.txt",
+        sidecar: v2_signed("signed.txt"),
+        verifies: true,
+    });
+
+    let mut none = v2_signed("no-timestamp.txt");
+
+    none.as_object_mut().unwrap().remove("timestamps");
+    cases.push(Case {
+        file: "no-timestamp.txt",
+        sidecar: none,
+        verifies: false,
+    });
+
+    let mut other = v2_signed("timestamp-other-signature.txt");
+
+    other["timestamps"] =
+        json!([BASE64_STANDARD.encode(d.timestamp(b"another signature", signed, false))]);
+    cases.push(Case {
+        file: "timestamp-other-signature.txt",
+        sidecar: other,
+        verifies: false,
+    });
+
+    let mut late = v2_signed("timestamp-after-certificate.txt");
+    let late_sig = sig_of(&late);
+
+    late["timestamps"] =
+        json!([BASE64_STANDARD.encode(d.timestamp(&late_sig, signed + 3600, false))]);
+    cases.push(Case {
+        file: "timestamp-after-certificate.txt",
+        sidecar: late,
+        verifies: false,
+    });
+
+    let mut forged = v2_signed("checkpoint-other-key.txt");
+    let proof = forged["transparency"]["inclusionProof"].clone();
+    let root_hash = BASE64_STANDARD
+        .decode(proof["rootHash"].as_str().unwrap())
+        .unwrap();
+
+    forged["transparency"]["inclusionProof"]["checkpoint"] = json!(checkpoint(
+        &d.log2_origin(),
+        &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+        proof["treeSize"].as_u64().unwrap(),
+        &root_hash
+    ));
+    cases.push(Case {
+        file: "checkpoint-other-key.txt",
+        sidecar: forged,
+        verifies: false,
+    });
+
+    let mut witnessed = v2_signed("checkpoint-witness-first.txt");
+    let note = witnessed["transparency"]["inclusionProof"]["checkpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (text, sigs) = note.split_once("\n\n").unwrap();
+
+    witnessed["transparency"]["inclusionProof"]["checkpoint"] = json!(format!(
+        "{text}\n\n\u{2014} witness.test AAAAAAAAAAAAAAAAAAAAAAAA\n{sigs}"
+    ));
+    cases.push(Case {
+        file: "checkpoint-witness-first.txt",
+        sidecar: witnessed,
+        verifies: true,
+    });
+
+    let mut tampered = v2_signed("proof-tampered.txt");
+
+    tampered["transparency"]["inclusionProof"]["hashes"][0] =
+        json!(BASE64_STANDARD.encode([7u8; 32]));
+    cases.push(Case {
+        file: "proof-tampered.txt",
+        sidecar: tampered,
+        verifies: false,
+    });
+
+    let v1_body = body("v1-with-timestamp.txt");
+    let mut v1 = d.sign_file_at(
+        "v1-with-timestamp.txt",
+        v1_body.as_bytes(),
+        ALICE,
+        ACME_SSO,
+        signed,
+    );
+
+    d.add_timestamp(&mut v1, signed + 5);
+    cases.push(Case {
+        file: "v1-with-timestamp.txt",
+        sidecar: v1,
+        verifies: true,
+    });
+
+    // The README's claims, checked against the core before anything is written.
+    for c in &cases {
+        let result = verify_keyless_with(&c.sidecar, std::slice::from_ref(&root));
+
+        assert_eq!(result.is_ok(), c.verifies, "{}: {:?}", c.file, result.err());
+        if let Ok(v) = result {
+            assert_eq!(v.signed_at, signed, "{}", c.file);
+        }
+    }
+
+    let _ = fs::remove_dir_all(out.join("artifacts"));
+    fs::create_dir_all(out.join("artifacts")).unwrap();
+    write_json(&out.join("trusted_root.json"), &doc);
+    for c in &cases {
+        let file = if c.file == "v1-with-timestamp.txt" {
+            v1_body.clone()
+        } else {
+            body(c.file)
+        };
+
+        fs::write(out.join("artifacts").join(c.file), file).unwrap();
+        write_json(
+            &out.join("artifacts").join(format!("{}.psig.json", c.file)),
+            &c.sidecar,
+        );
+    }
 }

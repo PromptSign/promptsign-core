@@ -232,8 +232,18 @@ fn the_public_sigstore_trusted_root_parses() {
     let root = Root::from_trusted_root("from-tuf", &doc).unwrap();
     let pinned = sigstore_public();
 
-    // Rekor v1 (P-256) is usable; the Ed25519 Rekor v2 log is skipped.
-    assert_eq!(root.log_ids(), pinned.log_ids());
+    // Rekor v1 (P-256) and the Ed25519 Rekor v2 log are both usable. The v2
+    // log's id is its signed-note key hash, which covers the origin.
+    assert_eq!(root.log_ids()[0], pinned.log_ids()[0]);
+    assert_eq!(
+        root.log_ids()[1],
+        "cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0"
+    );
+    assert_eq!(
+        root.rekor_logs[1].origin().as_deref(),
+        Some("log2025-1.rekor.sigstore.dev")
+    );
+    assert_eq!(root.tsas.len(), 1);
     assert!(!root.is_ca_only());
 
     let bundle = read_json(oms("upstream-v1.1.0-sigstore/model.sig"));

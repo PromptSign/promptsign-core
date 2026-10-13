@@ -14,6 +14,8 @@ use x509_cert::Certificate;
 
 const OID_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 const OID_ECDSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+const OID_ECDSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
+const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 const OID_RSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 const OID_RSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
 const OID_RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
@@ -26,6 +28,12 @@ const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15"
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 const OID_EKU_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
 const OID_EKU_ANY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37.0");
+pub(crate) const OID_SHA256: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+pub(crate) const OID_SHA384: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+pub(crate) const OID_SHA512: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 
 pub(crate) fn spki_der_of(cert: &Certificate) -> Result<Vec<u8>> {
     cert.tbs_certificate
@@ -191,7 +199,97 @@ pub(crate) fn verify_leaf_signature(leaf: &Certificate, message: &[u8], sig: &[u
         .map_err(|_| "signature verification failed".to_string())
 }
 
-fn extension(cert: &Certificate, oid: ObjectIdentifier) -> Option<&x509_cert::ext::Extension> {
+/// Tests only: a signature over a SHA-256 digest the caller computed, as a
+/// Sigstore message signature over an artifact is.
+#[cfg(test)]
+pub(crate) fn verify_leaf_prehash(leaf: &Certificate, digest: &[u8], sig: &[u8]) -> Result<()> {
+    verify_ecdsa_prehash(&spki_der_of(leaf)?, ec_curve(leaf)?, digest, sig)
+}
+
+/// SHA-2 digest of `message` under a digest AlgorithmIdentifier OID.
+pub(crate) fn digest_with(alg: ObjectIdentifier, message: &[u8]) -> Result<Vec<u8>> {
+    if alg == OID_SHA256 {
+        Ok(Sha256::digest(message).to_vec())
+    } else if alg == OID_SHA384 {
+        Ok(Sha384::digest(message).to_vec())
+    } else if alg == OID_SHA512 {
+        Ok(Sha512::digest(message).to_vec())
+    } else {
+        Err(format!("unsupported digest algorithm: {alg}"))
+    }
+}
+
+/// Verify a CMS signature (RFC 5652 SignerInfo) with a certificate's key.
+/// `sig_alg` is the SignerInfo's signatureAlgorithm; a bare key algorithm
+/// (id-ecPublicKey, rsaEncryption) takes its hash from `digest_alg`.
+pub(crate) fn verify_cms_signature(
+    cert: &Certificate,
+    sig_alg: ObjectIdentifier,
+    digest_alg: ObjectIdentifier,
+    message: &[u8],
+    sig: &[u8],
+) -> Result<()> {
+    let spki_der = spki_der_of(cert)?;
+
+    if sig_alg == OID_ED25519 {
+        use ed25519_dalek::pkcs8::DecodePublicKey;
+        use ed25519_dalek::Verifier;
+
+        let vk = ed25519_dalek::VerifyingKey::from_public_key_der(&spki_der)
+            .map_err(|e| format!("Ed25519 key: {e}"))?;
+        let s = ed25519_dalek::Signature::from_slice(sig).map_err(|_| "malformed signature")?;
+
+        return vk
+            .verify(message, &s)
+            .map_err(|_| "signature verification failed".to_string());
+    }
+    if sig_alg == OID_RSA_ENCRYPTION
+        || sig_alg == OID_RSA_SHA256
+        || sig_alg == OID_RSA_SHA384
+        || sig_alg == OID_RSA_SHA512
+    {
+        let scheme_alg = match sig_alg {
+            a if a == OID_RSA_ENCRYPTION && digest_alg == OID_SHA256 => OID_RSA_SHA256,
+            a if a == OID_RSA_ENCRYPTION && digest_alg == OID_SHA384 => OID_RSA_SHA384,
+            a if a == OID_RSA_ENCRYPTION && digest_alg == OID_SHA512 => OID_RSA_SHA512,
+            a if a == OID_RSA_ENCRYPTION => {
+                return Err(format!("unsupported RSA digest algorithm: {digest_alg}"))
+            }
+            a => a,
+        };
+
+        return verify_rsa_pkcs1(&spki_der, scheme_alg, message, sig)
+            .map_err(|_| "signature verification failed".to_string());
+    }
+
+    let hash_alg = if sig_alg == OID_ECDSA_SHA256 {
+        OID_SHA256
+    } else if sig_alg == OID_ECDSA_SHA384 {
+        OID_SHA384
+    } else if sig_alg == OID_ECDSA_SHA512 {
+        OID_SHA512
+    } else if sig_alg == OID_EC_PUBLIC_KEY {
+        digest_alg
+    } else {
+        return Err(format!("unsupported signature algorithm: {sig_alg}"));
+    };
+
+    if cert.tbs_certificate.subject_public_key_info.algorithm.oid != OID_EC_PUBLIC_KEY {
+        return Err("signing certificate does not hold an EC key".to_string());
+    }
+    verify_ecdsa_prehash(
+        &spki_der,
+        ec_curve(cert)?,
+        &digest_with(hash_alg, message)?,
+        sig,
+    )
+    .map_err(|_| "signature verification failed".to_string())
+}
+
+pub(crate) fn extension(
+    cert: &Certificate,
+    oid: ObjectIdentifier,
+) -> Option<&x509_cert::ext::Extension> {
     cert.tbs_certificate
         .extensions
         .as_ref()?
@@ -201,7 +299,7 @@ fn extension(cert: &Certificate, oid: ObjectIdentifier) -> Option<&x509_cert::ex
 
 /// A certificate that issues another one must say it is a CA, and its path
 /// length limit must allow the CA certificates beneath it.
-fn check_issuer(cert: &Certificate, cas_below: usize) -> Result<()> {
+pub(crate) fn check_issuer(cert: &Certificate, cas_below: usize) -> Result<()> {
     let ext = extension(cert, OID_BASIC_CONSTRAINTS).ok_or_else(|| {
         format!(
             "\"{}\" issues certificates but has no basic constraints",

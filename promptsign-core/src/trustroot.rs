@@ -1,7 +1,8 @@
 // Multi-root trust: a registry of named roots a verifier accepts.
 //
 // The built-in root "sigstore-public" is the pinned pair in the trust
-// directory (fulcio.pem + rekor.pub). Every other root is a document in
+// directory (fulcio.pem + rekor.pub), joined by the public trusted_root.json
+// when the directory has one. Every other root is a document in
 // Sigstore's trusted_root.json shape under <trust dir>/roots/<name>.json. A
 // root with transparency logs verifies keyless signatures; a root with
 // certificate authorities only verifies certificate-mode signatures, checked
@@ -9,6 +10,7 @@
 
 use crate::chain::{is_self_signed, subject_of};
 use crate::keyless::{parse_rekor_logs, trust_dir, RekorLog};
+use crate::timestamp::TimestampAuthority;
 use crate::trustbundle::installed_in;
 use crate::util::{format_iso8601, hex, parse_iso8601, promptsign_home, sha256_hex};
 use crate::Result;
@@ -23,8 +25,9 @@ pub const DEFAULT_ROOT: &str = "sigstore-public";
 pub const TRUSTED_ROOT_MEDIA_TYPE: &str =
     "application/vnd.dev.sigstore.trustedroot+json;version=0.1";
 
-/// A `validFor` window, `[start, end)` in Unix seconds (spec/07 §4). A
-/// missing side is open, and a missing window is always valid.
+/// A `validFor` window, `[start, end]` in Unix seconds (spec/07 §4): closed
+/// at both ends, like Sigstore's TimeRange. A missing side is open, and a
+/// missing window is always valid.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Window {
     pub start: Option<i64>,
@@ -33,7 +36,7 @@ pub struct Window {
 
 impl Window {
     pub fn contains(&self, t: i64) -> bool {
-        !matches!(self.start, Some(s) if t < s) && !matches!(self.end, Some(e) if t >= e)
+        !matches!(self.start, Some(s) if t < s) && !matches!(self.end, Some(e) if t > e)
     }
 
     fn from_json(v: &Value) -> Result<Window> {
@@ -86,6 +89,9 @@ pub struct Root {
     /// Transparency logs whose entries this root accepts. Empty for a
     /// certificate-mode root.
     pub rekor_logs: Vec<RekorLog>,
+    /// RFC 3161 timestamp authorities whose timestamps date signatures under
+    /// this root (spec/07 §1).
+    pub tsas: Vec<TimestampAuthority>,
     /// Hex SHA-256 of the anchor certificate's DER.
     pub fingerprint: String,
     /// Subject DN of the anchor certificate.
@@ -120,6 +126,7 @@ impl Root {
             ca_certs,
             ca_valid,
             rekor_logs,
+            tsas: Vec::new(),
             expires: None,
         })
     }
@@ -143,9 +150,9 @@ impl Root {
     }
 
     /// A root from a Sigstore `trusted_root.json` document (spec/07 §1).
-    /// Logs whose key is not ECDSA P-256 (Rekor v2's Ed25519 logs) are
-    /// skipped: their entries carry no signed entry timestamp this verifier
-    /// can check. So is a log whose stated id is not its key's.
+    /// Logs with a key other than ECDSA P-256 or Ed25519 are skipped, as is
+    /// an Ed25519 log without a `baseUrl` (its id hashes the origin) and a
+    /// log whose stated id is not the one its key and origin give.
     pub fn from_trusted_root(name: &str, doc: &Value) -> Result<Root> {
         let mut ca_certs = Vec::new();
         let mut ca_valid = Vec::new();
@@ -157,22 +164,8 @@ impl Root {
         {
             let window = Window::from_json(&ca["validFor"])?;
 
-            for c in ca["certChain"]["certificates"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                let der = BASE64_STANDARD
-                    .decode(
-                        c["rawBytes"]
-                            .as_str()
-                            .ok_or("certificate without rawBytes")?,
-                    )
-                    .map_err(|_| "invalid base64 in certificate rawBytes")?;
-
-                ca_certs.push(
-                    Certificate::from_der(&der).map_err(|e| format!("certificate parse: {e}"))?,
-                );
+            for cert in certs_of(&ca["certChain"])? {
+                ca_certs.push(cert);
                 ca_valid.push(window);
             }
         }
@@ -181,19 +174,26 @@ impl Root {
 
         for log in doc["tlogs"].as_array().into_iter().flatten() {
             let details = log["publicKey"]["keyDetails"].as_str().unwrap_or("");
-
-            if !details.starts_with("PKIX_ECDSA_P256") {
+            let base_url = log["baseUrl"].as_str().filter(|u| !u.is_empty());
+            let der = || -> Result<Vec<u8>> {
+                BASE64_STANDARD
+                    .decode(
+                        log["publicKey"]["rawBytes"]
+                            .as_str()
+                            .ok_or("log key without rawBytes")?,
+                    )
+                    .map_err(|_| "invalid base64 in log key rawBytes".to_string())
+            };
+            let mut rekor = if details.starts_with("PKIX_ECDSA_P256") {
+                RekorLog::from_spki_der(&der()?)?
+            } else if details == "PKIX_ED25519" {
+                match base_url {
+                    Some(url) => RekorLog::ed25519(&der()?, url)?,
+                    None => continue,
+                }
+            } else {
                 continue;
-            }
-
-            let der = BASE64_STANDARD
-                .decode(
-                    log["publicKey"]["rawBytes"]
-                        .as_str()
-                        .ok_or("log key without rawBytes")?,
-                )
-                .map_err(|_| "invalid base64 in log key rawBytes")?;
-            let mut rekor = RekorLog::from_spki_der(&der)?;
+            };
 
             if let Some(stated) = log["logId"]["keyId"].as_str() {
                 if b64_to_hex(stated)? != rekor.log_id {
@@ -201,10 +201,51 @@ impl Root {
                 }
             }
             rekor.valid = Window::from_json(&log["publicKey"]["validFor"])?;
+            rekor.base_url = base_url.map(str::to_string);
             rekor_logs.push(rekor);
         }
 
-        Root::new(name, ca_certs, ca_valid, rekor_logs)
+        let mut tsas = Vec::new();
+
+        for tsa in doc["timestampAuthorities"].as_array().into_iter().flatten() {
+            let certs = certs_of(&tsa["certChain"])?;
+
+            if certs.is_empty() {
+                continue;
+            }
+            tsas.push(TimestampAuthority {
+                certs,
+                valid: Window::from_json(&tsa["validFor"])?,
+                uri: tsa["uri"].as_str().unwrap_or_default().to_string(),
+            });
+        }
+
+        let mut root = Root::new(name, ca_certs, ca_valid, rekor_logs)?;
+
+        root.tsas = tsas;
+        Ok(root)
+    }
+
+    /// The built-in root: the pinned pair joined with the public
+    /// `trusted_root.json`. The document's CAs and logs come first, so its
+    /// windows and base URLs apply; the pair adds what the document lacks.
+    fn joined(name: &str, doc: Root, pinned: Root) -> Result<Root> {
+        let mut ca_certs = doc.ca_certs;
+        let mut ca_valid = doc.ca_valid;
+        let mut rekor_logs = doc.rekor_logs;
+
+        ca_certs.extend(pinned.ca_certs);
+        ca_valid.extend(pinned.ca_valid);
+        for log in pinned.rekor_logs {
+            if !rekor_logs.iter().any(|l| l.log_id == log.log_id) {
+                rekor_logs.push(log);
+            }
+        }
+
+        let mut root = Root::new(name, ca_certs, ca_valid, rekor_logs)?;
+
+        root.tsas = doc.tsas;
+        Ok(root)
     }
 
     /// This root as a `trusted_root.json` document. Consecutive certificates
@@ -216,17 +257,47 @@ impl Root {
             .map(|l| {
                 let mut public_key = json!({
                     "rawBytes": BASE64_STANDARD.encode(&l.spki_der),
-                    "keyDetails": "PKIX_ECDSA_P256_SHA_256"
+                    "keyDetails": l.key_details()
                 });
 
                 if let Some(w) = l.valid.to_json() {
                     public_key["validFor"] = w;
                 }
-                json!({
+
+                let mut log = json!({
                     "hashAlgorithm": "SHA2_256",
                     "publicKey": public_key,
                     "logId": { "keyId": BASE64_STANDARD.encode(hex_decode(&l.log_id)) }
-                })
+                });
+
+                if let Some(url) = &l.base_url {
+                    log["baseUrl"] = json!(url);
+                }
+                log
+            })
+            .collect();
+        let tsas: Vec<Value> = self
+            .tsas
+            .iter()
+            .map(|t| {
+                let certificates: Vec<Value> = t
+                    .certs
+                    .iter()
+                    .map(|c| json!({ "rawBytes": BASE64_STANDARD.encode(c.to_der().unwrap_or_default()) }))
+                    .collect();
+                let anchor = t.certs.last().map(subject_of).unwrap_or_default();
+                let mut out = json!({
+                    "subject": { "commonName": anchor },
+                    "certChain": { "certificates": certificates }
+                });
+
+                if !t.uri.is_empty() {
+                    out["uri"] = json!(t.uri);
+                }
+                if let Some(w) = t.valid.to_json() {
+                    out["validFor"] = w;
+                }
+                out
             })
             .collect();
         let mut groups: Vec<(Window, Vec<Value>)> = Vec::new();
@@ -260,7 +331,7 @@ impl Root {
             "tlogs": tlogs,
             "certificateAuthorities": authorities,
             "ctlogs": [],
-            "timestampAuthorities": []
+            "timestampAuthorities": tsas
         })
     }
 
@@ -282,6 +353,26 @@ impl Root {
     pub fn log_ids(&self) -> Vec<String> {
         self.rekor_logs.iter().map(|l| l.log_id.clone()).collect()
     }
+}
+
+/// The certificates of a `certChain` object, in order.
+fn certs_of(chain: &Value) -> Result<Vec<Certificate>> {
+    chain["certificates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let der = BASE64_STANDARD
+                .decode(
+                    c["rawBytes"]
+                        .as_str()
+                        .ok_or("certificate without rawBytes")?,
+                )
+                .map_err(|_| "invalid base64 in certificate rawBytes")?;
+
+            Certificate::from_der(&der).map_err(|e| format!("certificate parse: {e}"))
+        })
+        .collect()
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
@@ -362,20 +453,44 @@ fn registry(dir: &Path, pinned: Vec<Root>) -> Result<Vec<Root>> {
     Ok(roots)
 }
 
+/// The built-in root from the trust directory: the pinned pair
+/// (`fulcio.pem` + `rekor.pub`), the public `trusted_root.json`, or both
+/// joined. The document is what carries Rekor v2 logs and timestamp
+/// authorities.
 pub(crate) fn load_pinned(dir: &Path) -> Result<Option<Root>> {
     let fulcio = dir.join("fulcio.pem");
     let rekor = dir.join("rekor.pub");
+    let doc_path = dir.join("trusted_root.json");
+    let pinned = if fulcio.exists() && rekor.exists() {
+        let pem = fs::read(&fulcio).map_err(|e| format!("{}: {e}", fulcio.display()))?;
+        let rekor_pem =
+            fs::read_to_string(&rekor).map_err(|e| format!("{}: {e}", rekor.display()))?;
 
-    if !fulcio.exists() || !rekor.exists() {
-        return Ok(None);
+        Some(
+            Root::from_pem(DEFAULT_ROOT, &pem, &rekor_pem)
+                .map_err(|e| format!("{}: {e}", dir.display()))?,
+        )
+    } else {
+        None
+    };
+    let doc = if doc_path.exists() {
+        let v: Value = serde_json::from_slice(
+            &fs::read(&doc_path).map_err(|e| format!("{}: {e}", doc_path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", doc_path.display()))?;
+
+        Some(
+            Root::from_trusted_root(DEFAULT_ROOT, &v)
+                .map_err(|e| format!("{}: {e}", doc_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    match (doc, pinned) {
+        (Some(d), Some(p)) => Root::joined(DEFAULT_ROOT, d, p).map(Some),
+        (d, p) => Ok(d.or(p)),
     }
-
-    let pem = fs::read(&fulcio).map_err(|e| format!("{}: {e}", fulcio.display()))?;
-    let rekor_pem = fs::read_to_string(&rekor).map_err(|e| format!("{}: {e}", rekor.display()))?;
-
-    Root::from_pem(DEFAULT_ROOT, &pem, &rekor_pem)
-        .map(Some)
-        .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 pub(crate) fn load_named_in(rdir: &Path) -> Result<Vec<Root>> {
@@ -468,4 +583,23 @@ pub fn remove_root(dir: &Path, name: &str) -> Result<()> {
         return Err(format!("no trust root named \"{name}\""));
     }
     fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_are_closed_at_both_ends() {
+        let w = Window {
+            start: Some(100),
+            end: Some(200),
+        };
+
+        assert!(!w.contains(99));
+        assert!(w.contains(100));
+        assert!(w.contains(200));
+        assert!(!w.contains(201));
+        assert!(Window::default().contains(i64::MIN));
+    }
 }
