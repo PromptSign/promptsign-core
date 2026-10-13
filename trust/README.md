@@ -1,11 +1,13 @@
 # The canonical pinned Sigstore trust root
 
 `fulcio.pem` holds the Fulcio CA certificate chain and `rekor.pub` holds the
-Rekor transparency log's public key. PromptSign anchors every keyless signature
-it checks to these two files. **This directory holds the originals.** Every
-other place that has them holds a copy.
+Rekor transparency log's public key. `trusted_root.json` is Sigstore's public
+trust root document, which adds the Rekor v2 log and the timestamp authority,
+each with its validity window. PromptSign anchors every keyless signature it
+checks to these files, joined into one built-in root. **This directory holds
+the originals.** Every other place that has them holds a copy.
 
-The repository pins and commits both files, so a fresh install verifies offline
+The repository pins and commits all three, so a fresh install verifies offline
 on first use. Fetching the root over TLS on first use would make the trust root
 itself trust-on-first-use, and pinning exists to prevent exactly that.
 
@@ -74,6 +76,19 @@ cat ~/.promptsign/trust/fulcio.pem >> trust/fulcio.pem
 node scripts/sync-trust.mjs                         # push the change to the copies
 cd promptsign-napi && node --test test/trust-root.test.mjs
 ```
+
+Refresh `trusted_root.json` by replacing the whole file. `promptsign trust
+fetch` checks it against Sigstore's root signing keys through TUF, and Sigstore
+keeps retired logs and CAs in it with a closed window:
+
+```sh
+promptsign trust fetch
+cp ~/.promptsign/trust/trusted_root.json trust/trusted_root.json
+node scripts/sync-trust.mjs
+```
+
+The watcher covers `fulcio.pem` and `rekor.pub` only, so refresh this file by
+hand when Sigstore starts a new Rekor v2 log shard.
 
 Put new material first if you want it listed as current; otherwise the order
 does not matter. `test/trust-root.test.mjs` asserts that the already-pinned log

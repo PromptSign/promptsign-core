@@ -76,6 +76,10 @@ describe('the pinned trust root', () => {
   test('ships in the package', () => {
     assert.ok(fs.existsSync(path.join(TRUST_DIR, 'fulcio.pem')), 'trust/fulcio.pem is missing');
     assert.ok(fs.existsSync(path.join(TRUST_DIR, 'rekor.pub')), 'trust/rekor.pub is missing');
+    assert.ok(
+      fs.existsSync(path.join(TRUST_DIR, 'trusted_root.json')),
+      'trust/trusted_root.json is missing',
+    );
   });
 
   test('is published — trust/ is in package.json files', () => {
@@ -96,6 +100,22 @@ describe('the pinned trust root', () => {
     );
   });
 
+  // The document is what carries the Rekor v2 log and the timestamp
+  // authority; without them a v2 signature has no log and no signing time.
+  test('trusted_root.json carries the Rekor v2 log and a timestamp authority', () => {
+    const doc = JSON.parse(fs.readFileSync(path.join(TRUST_DIR, 'trusted_root.json'), 'utf8'));
+    assert.equal(doc.mediaType, 'application/vnd.dev.sigstore.trustedroot+json;version=0.1');
+    assert.ok(
+      doc.tlogs.some(
+        (l) =>
+          l.publicKey.keyDetails === 'PKIX_ED25519' &&
+          l.baseUrl === 'https://log2025-1.rekor.sigstore.dev',
+      ),
+      'no Rekor v2 log',
+    );
+    assert.ok(doc.timestampAuthorities.length > 0, 'no timestamp authority');
+  });
+
   test('fulcio.pem is a certificate chain, not an empty or stray file', () => {
     const pem = fs.readFileSync(path.join(TRUST_DIR, 'fulcio.pem'), 'utf8');
     assert.match(pem, /-----BEGIN CERTIFICATE-----/);
@@ -112,7 +132,7 @@ describe('the pinned trust root', () => {
     'matches the canonical root in trust/',
     { skip: fs.existsSync(CANONICAL_TRUST_DIR) ? false : 'not a source checkout' },
     () => {
-      for (const name of ['fulcio.pem', 'rekor.pub']) {
+      for (const name of ['fulcio.pem', 'rekor.pub', 'trusted_root.json']) {
         const canonical = fs.readFileSync(path.join(CANONICAL_TRUST_DIR, name));
         const copy = fs.readFileSync(path.join(TRUST_DIR, name));
         assert.ok(

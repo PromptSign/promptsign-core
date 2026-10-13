@@ -22,8 +22,8 @@ const repoRoot = path.resolve(here, '..');
 // The canonical directory also holds a README explaining what it is, which the
 // copies deliberately do not get: promptsign-napi/trust/ ships to npm, and a
 // file telling the reader to edit a directory that is not in the tarball would
-// be worse than no file at all. Only these two are the trust root.
-const FILES = ['fulcio.pem', 'rekor.pub'];
+// be worse than no file at all. Only these three are the trust root.
+const FILES = ['fulcio.pem', 'rekor.pub', 'trusted_root.json'];
 const CANONICAL = path.join(repoRoot, 'trust');
 const COPIES = [path.join(repoRoot, 'promptsign-napi', 'trust')];
 

@@ -29,7 +29,8 @@ the good kind — one thing to audit, one place to fix.
 ## Where the pinned trust root lives
 
 [`trust/`](trust/) at the repository root is the canonical, single source of
-truth for the pinned Sigstore trust root — `fulcio.pem` and `rekor.pub`. This
+truth for the pinned Sigstore trust root: `fulcio.pem`, `rekor.pub` and the
+public `trusted_root.json`. This
 repository owns it, and everything else that carries those bytes carries a copy:
 `promptsign-napi/trust/`, because npm publishes only what is inside the package
 directory, and `promptsign-plugin/trust/`, because the plugin's binary tier has

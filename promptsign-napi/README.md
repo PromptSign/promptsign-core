@@ -50,8 +50,10 @@ honour `PROMPTSIGN_HOME`.
 
 ## Trust root
 
-Every keyless signature is checked against a Sigstore trust root: Fulcio's CA
-chain (`fulcio.pem`) and the Rekor log's public key (`rekor.pub`). This package
+The verifier checks every keyless signature against a Sigstore trust root:
+Fulcio's CA chain (`fulcio.pem`), the Rekor log's public key (`rekor.pub`), and
+Sigstore's `trusted_root.json`, which adds the Rekor v2 log and the timestamp
+authority. This package
 ships a copy in `trust/`, so `npm install` is all that is needed. 
 Verification does not require `promptsign trust fetch`, or the CLI at all.
 
