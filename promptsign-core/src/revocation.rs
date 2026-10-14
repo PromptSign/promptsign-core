@@ -271,6 +271,20 @@ pub fn is_stale(feed: &RevocationFeed, policy: &Policy) -> bool {
 pub struct RevocationOutcome {
     pub findings: Vec<Finding>,
     pub action: Action,
+    pub state: RevocationState,
+}
+
+/// What the feed said about one artifact, for the decision log (spec/08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevocationState {
+    /// A fresh feed does not list it.
+    Clear,
+    Revoked,
+    /// The newest feed that verifies is past `max_feed_staleness`.
+    Stale,
+    /// No feed is cached, or none verifies.
+    Unavailable,
 }
 
 /// Full offline revocation evaluation (spec/06 §4). Caller invokes this only when
@@ -284,7 +298,7 @@ pub fn evaluate(policy: &Policy, subject: &Subject) -> RevocationOutcome {
             ("warn", Action::Warn)
         }
     };
-    let unavailable = |msg: String| {
+    let degraded = |msg: String, state: RevocationState| {
         let (level, action) = degrade();
 
         RevocationOutcome {
@@ -293,8 +307,10 @@ pub fn evaluate(policy: &Policy, subject: &Subject) -> RevocationOutcome {
                 message: msg,
             }],
             action,
+            state,
         }
     };
+    let unavailable = |msg: String| degraded(msg, RevocationState::Unavailable);
 
     let feed = match freshest_feed(policy) {
         Ok(Some(f)) => f,
@@ -314,17 +330,22 @@ pub fn evaluate(policy: &Policy, subject: &Subject) -> RevocationOutcome {
                 message: format!("revoked — {reason}"),
             }],
             action: Action::Fail,
+            state: RevocationState::Revoked,
         };
     }
     if is_stale(&feed, policy) {
-        return unavailable(format!(
-            "revocation feed is stale (generated {}) — run `promptsign revoke fetch`",
-            feed.generated_at
-        ));
+        return degraded(
+            format!(
+                "revocation feed is stale (generated {}) — run `promptsign revoke fetch`",
+                feed.generated_at
+            ),
+            RevocationState::Stale,
+        );
     }
     RevocationOutcome {
         findings: Vec::new(),
         action: Action::Pass,
+        state: RevocationState::Clear,
     }
 }
 

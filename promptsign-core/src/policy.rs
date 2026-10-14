@@ -69,6 +69,17 @@ pub struct Policy {
     /// bundles from the registry (spec/07 §2.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_roots: Option<bool>,
+    /// Append every verification to a local decision log (spec/08).
+    /// Verifiers read it from the managed and the user policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_log: Option<bool>,
+    /// Directory of that layer's log: `<managed>/log` or
+    /// `<PROMPTSIGN_HOME>/log` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_log_dir: Option<String>,
+    /// Size at which the log rotates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_log_max_bytes: Option<u64>,
 }
 
 pub fn default_policy() -> Policy {
@@ -90,6 +101,9 @@ pub fn default_policy() -> Policy {
         strict: None,
         lock_env: None,
         user_roots: None,
+        decision_log: None,
+        decision_log_dir: None,
+        decision_log_max_bytes: None,
     }
 }
 
@@ -238,7 +252,13 @@ fn without_tofu(policy: &Policy) -> Policy {
 }
 
 /// Add a tighten-only layer's findings, prefixed, and keep the worse action.
-fn tighten(out: &mut EvalOutcome, extra: EvalOutcome, prefix: &str) {
+/// The first layer that makes the action worse decides it.
+fn tighten(out: &mut EvalOutcome, extra: EvalOutcome, layer: &'static str, policy: &Policy) {
+    let prefix = format!("{layer} policy: ");
+
+    if extra.action > out.action {
+        out.decided_by = Some(DecidingRule::of(layer, policy, &extra.rule));
+    }
     out.findings
         .extend(extra.findings.into_iter().map(|f| Finding {
             level: f.level,
@@ -273,8 +293,14 @@ impl EffectivePolicy {
     /// action wins. TOFU pins are the user's: the base or the user layer
     /// checks them once, a project layer never does.
     pub fn evaluate(&self, input: &EvalInput, pins: &Pins) -> EvalOutcome {
+        let base_layer = if self.managed.is_some() {
+            "managed"
+        } else {
+            "user"
+        };
         let mut out = evaluate(self.base(), input, pins);
 
+        out.decided_by = Some(DecidingRule::of(base_layer, self.base(), &out.rule));
         if let Some(user) = self.user_over_managed() {
             let extra = if out.rule.tofu == Some(true) {
                 evaluate(&without_tofu(user), input, &Pins::new())
@@ -282,12 +308,12 @@ impl EffectivePolicy {
                 evaluate(user, input, pins)
             };
 
-            tighten(&mut out, extra, "user policy: ");
+            tighten(&mut out, extra, "user", user);
         }
         if let Some(project) = &self.project {
             let extra = evaluate(&without_tofu(project), input, &Pins::new());
 
-            tighten(&mut out, extra, "project policy: ");
+            tighten(&mut out, extra, "project", project);
         }
         out
     }
@@ -502,6 +528,37 @@ pub struct EvalOutcome {
     pub findings: Vec<Finding>,
     pub rule: Rule,
     pub pin_update: Option<Pin>,
+    /// The layer and rule that set `action`. Only
+    /// [`EffectivePolicy::evaluate`] knows the layers; [`evaluate`] leaves it
+    /// empty.
+    pub decided_by: Option<DecidingRule>,
+}
+
+/// The rule behind a policy outcome, as the decision log records it
+/// (spec/08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecidingRule {
+    /// `managed`, `user` (the user's file or the built-in default) or
+    /// `project`.
+    pub layer: &'static str,
+    pub pattern: String,
+    /// The rule's action, else the layer's default: `enforce`, `warn` or
+    /// `off`.
+    pub action: String,
+}
+
+impl DecidingRule {
+    fn of(layer: &'static str, policy: &Policy, rule: &Rule) -> Self {
+        DecidingRule {
+            layer,
+            pattern: rule.pattern.clone(),
+            action: rule
+                .action
+                .clone()
+                .or_else(|| policy.default_action.clone())
+                .unwrap_or_else(|| "warn".to_string()),
+        }
+    }
 }
 
 /// Evaluate a verified signer against policy. `signed: false` means no bundle
@@ -567,6 +624,7 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
             findings,
             rule,
             pin_update: None,
+            decided_by: None,
         };
     }
 
@@ -674,6 +732,7 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
         findings,
         rule,
         pin_update,
+        decided_by: None,
     }
 }
 
@@ -1320,5 +1379,33 @@ mod tests {
 
         assert!(!eff.trust_bundle_stale_fails());
         assert!(!eff.strict());
+    }
+
+    #[test]
+    fn the_layer_that_sets_the_action_is_the_deciding_one() {
+        let decided = |eff: &EffectivePolicy| {
+            let d = eff
+                .evaluate(&unsigned("acme/deploy"), &Pins::new())
+                .decided_by
+                .unwrap();
+
+            (d.layer, d.pattern, d.action)
+        };
+        let managed = policy_with(vec![rule("*", "warn")]);
+        let project = policy_with(vec![rule("acme/*", "enforce")]);
+
+        assert_eq!(
+            decided(&layered(Some(managed.clone()), None, None)),
+            ("managed", "*".to_string(), "warn".to_string())
+        );
+        assert_eq!(
+            decided(&layered(Some(managed.clone()), None, Some(project))),
+            ("project", "acme/*".to_string(), "enforce".to_string())
+        );
+        // A layer that only matches the action leaves the decision where it was.
+        assert_eq!(
+            decided(&layered(None, Some(managed.clone()), Some(managed))),
+            ("user", "*".to_string(), "warn".to_string())
+        );
     }
 }

@@ -8,9 +8,10 @@ use crate::manifest::{
 };
 use crate::oms;
 use crate::policy::{
-    load_effective_policy, load_pins, save_pins, Action, EffectivePolicy, EvalInput, Finding, Pins,
+    load_effective_policy, load_pins, save_pins, Action, DecidingRule, EffectivePolicy, EvalInput,
+    Finding, Pins,
 };
-use crate::revocation::{self, Subject};
+use crate::revocation::{self, RevocationState, Subject};
 use crate::trustroot::{load_full_registry, load_registry};
 use crate::util::format_iso8601;
 use crate::Result;
@@ -54,6 +55,21 @@ pub struct VerifyResult {
     pub signed: bool,
     pub action: Action,
     pub findings: Vec<Finding>,
+    /// For the decision log; not part of the JSON output.
+    #[serde(skip)]
+    pub evidence: Evidence,
+}
+
+/// What a verification established beyond its verdict, as the decision log
+/// records it (spec/08).
+#[derive(Debug, Clone, Default)]
+pub struct Evidence {
+    /// sha256 of the DSSE payload, the digest a revocation entry matches.
+    pub payload_digest: Option<String>,
+    /// The policy layer and rule that set the policy's part of the action.
+    pub rule: Option<DecidingRule>,
+    /// Absent when no revocation feed applies.
+    pub revocation: Option<RevocationState>,
 }
 
 fn basename(p: &Path) -> String {
@@ -189,6 +205,10 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
             );
             let mut findings = out.findings;
             let mut action = out.action;
+            let evidence = Evidence {
+                rule: out.decided_by,
+                ..Default::default()
+            };
 
             apply_markers(
                 &marker_msgs,
@@ -212,6 +232,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 signed: false,
                 action,
                 findings,
+                evidence,
             });
         }
         BundleSource::CarriageError(msg) => {
@@ -244,6 +265,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 signed: true,
                 action,
                 findings,
+                evidence: Evidence::default(),
             });
         }
         BundleSource::Found { value, path } => (value, path),
@@ -380,6 +402,10 @@ fn finish(
             signed: true,
             action,
             findings,
+            evidence: Evidence {
+                payload_digest: Some(signed.payload_digest),
+                ..Default::default()
+            },
         });
     }
 
@@ -410,6 +436,8 @@ fn finish(
 
     apply_markers(marker_msgs, eff, &signed.name, &mut findings, &mut action);
 
+    let mut revocation_state = None;
+
     // Revocation feed (spec/06): "valid yesterday, killed today". Consulted only
     // when a feed is configured; every subject field comes from the
     // authenticated bundle.
@@ -423,6 +451,7 @@ fn finish(
         };
         let rev = revocation::evaluate(rev_policy, &subject);
 
+        revocation_state = Some(rev.state);
         findings.extend(rev.findings);
         if rev.action > action {
             action = rev.action;
@@ -469,6 +498,11 @@ fn finish(
         signed: true,
         action,
         findings,
+        evidence: Evidence {
+            payload_digest: Some(signed.payload_digest),
+            rule: out.decided_by,
+            revocation: revocation_state,
+        },
     })
 }
 
@@ -541,6 +575,7 @@ fn signature_failure(
         signed: true,
         action,
         findings,
+        evidence: Evidence::default(),
     }
 }
 

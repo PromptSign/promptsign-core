@@ -9,6 +9,7 @@
 pub mod bundle;
 pub mod canonicalize;
 mod chain;
+pub mod decision_log;
 pub mod keyless;
 pub mod keys;
 mod logproof;
