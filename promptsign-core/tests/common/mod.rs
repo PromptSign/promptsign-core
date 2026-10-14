@@ -184,6 +184,18 @@ impl MockSigstore {
         issuer: &str,
         integrated_time: i64,
     ) -> Value {
+        self.sign_typed_payload_at(PAYLOAD_TYPE, payload, identity, issuer, integrated_time)
+    }
+
+    /// As `sign_payload_at`, with another DSSE payloadType.
+    pub fn sign_typed_payload_at(
+        &self,
+        payload_type: &str,
+        payload: &[u8],
+        identity: &str,
+        issuer: &str,
+        integrated_time: i64,
+    ) -> Value {
         let serial = self.serial.get();
 
         self.serial.set(serial + 1);
@@ -220,7 +232,7 @@ impl MockSigstore {
         leaf.add_extension(&IssuerExt(issuer.to_string())).unwrap();
 
         let leaf_cert: Certificate = leaf.build::<p256::ecdsa::DerSignature>().unwrap();
-        let sig_b64 = BASE64_STANDARD.encode(leaf_key.sign(&pae(PAYLOAD_TYPE, payload)).to_bytes());
+        let sig_b64 = BASE64_STANDARD.encode(leaf_key.sign(&pae(payload_type, payload)).to_bytes());
         let body = json!({
             "apiVersion": "0.0.1",
             "kind": "dsse",
@@ -247,7 +259,7 @@ impl MockSigstore {
         json!({
             "schema": "promptsign/bundle/v1",
             "envelope": {
-                "payloadType": PAYLOAD_TYPE,
+                "payloadType": payload_type,
                 "payload": BASE64_STANDARD.encode(payload),
                 "signatures": [{ "keyid": "", "sig": sig_b64 }]
             },

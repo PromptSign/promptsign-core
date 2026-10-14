@@ -47,6 +47,9 @@ pub struct Policy {
     pub revocation_feed_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_feed_issuer: Option<String>,
+    /// Glob over the registry root the feed's signature must chain to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_feed_trust_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_feed_staleness: Option<String>,
     /// "warn" (default) or "fail": how verify degrades when the feed is stale or
@@ -95,6 +98,7 @@ pub fn default_policy() -> Policy {
         revocation_feed: None,
         revocation_feed_identity: None,
         revocation_feed_issuer: None,
+        revocation_feed_trust_root: None,
         max_feed_staleness: None,
         on_feed_stale: None,
         on_trust_bundle_stale: None,
@@ -540,7 +544,7 @@ pub struct EvalOutcome {
 pub struct DecidingRule {
     /// `managed`, `user` (the user's file or the built-in default) or
     /// `project`.
-    pub layer: &'static str,
+    pub layer: String,
     pub pattern: String,
     /// The rule's action, else the layer's default: `enforce`, `warn` or
     /// `off`.
@@ -550,7 +554,7 @@ pub struct DecidingRule {
 impl DecidingRule {
     fn of(layer: &'static str, policy: &Policy, rule: &Rule) -> Self {
         DecidingRule {
-            layer,
+            layer: layer.to_string(),
             pattern: rule.pattern.clone(),
             action: rule
                 .action
@@ -1396,16 +1400,20 @@ mod tests {
 
         assert_eq!(
             decided(&layered(Some(managed.clone()), None, None)),
-            ("managed", "*".to_string(), "warn".to_string())
+            ("managed".to_string(), "*".to_string(), "warn".to_string())
         );
         assert_eq!(
             decided(&layered(Some(managed.clone()), None, Some(project))),
-            ("project", "acme/*".to_string(), "enforce".to_string())
+            (
+                "project".to_string(),
+                "acme/*".to_string(),
+                "enforce".to_string()
+            )
         );
         // A layer that only matches the action leaves the decision where it was.
         assert_eq!(
             decided(&layered(None, Some(managed.clone()), Some(managed))),
-            ("user", "*".to_string(), "warn".to_string())
+            ("user".to_string(), "*".to_string(), "warn".to_string())
         );
     }
 }

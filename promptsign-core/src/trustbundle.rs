@@ -37,6 +37,18 @@ pub struct BundleSigner {
     pub root: String,
 }
 
+/// Where the publisher serves its revocation feed and who signs it
+/// (spec/07 §5.1, spec/06 §3). `root` is resolved like a signer's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleFeed {
+    pub url: String,
+    /// Glob over the feed signer's identity.
+    pub identity: String,
+    /// Glob over the feed signer's issuer; any issuer when absent.
+    pub issuer: Option<String>,
+    pub root: String,
+}
+
 #[derive(Clone)]
 pub struct TrustBundle {
     /// The installed name. Every root is named `<name>/<root>`.
@@ -48,6 +60,7 @@ pub struct TrustBundle {
     pub expires: i64,
     pub roots: Vec<Root>,
     pub signers: Vec<BundleSigner>,
+    pub revocation_feed: Option<BundleFeed>,
 }
 
 /// The signer whose signature a bundle carried.
@@ -141,6 +154,18 @@ pub fn parse_trust_bundle(name: &str, bytes: &[u8]) -> Result<TrustBundle> {
         roots.push(root);
     }
 
+    // A signer's or a feed's `root`: the built-in root or one of this bundle's.
+    let resolve_root = |root: String, whose: &str| {
+        if root == DEFAULT_ROOT {
+            Ok(root)
+        } else if docs.contains_key(&root) {
+            Ok(format!("{name}/{root}"))
+        } else {
+            Err(format!(
+                "trust bundle {whose} root \"{root}\" is neither {DEFAULT_ROOT} nor one of the bundle's roots"
+            ))
+        }
+    };
     let mut signers = Vec::new();
 
     for s in v["signers"]
@@ -155,23 +180,35 @@ pub fn parse_trust_bundle(name: &str, bytes: &[u8]) -> Result<TrustBundle> {
                 .map(str::to_string)
                 .ok_or_else(|| format!("trust bundle signer has no {key}"))
         };
-        let root = field("root")?;
-        let resolved = if root == DEFAULT_ROOT {
-            root
-        } else if docs.contains_key(&root) {
-            format!("{name}/{root}")
-        } else {
-            return Err(format!(
-                "trust bundle signer root \"{root}\" is neither {DEFAULT_ROOT} nor one of the bundle's roots"
-            ));
-        };
-
         signers.push(BundleSigner {
+            root: resolve_root(field("root")?, "signer")?,
             identity: field("identity")?,
             issuer: field("issuer")?,
-            root: resolved,
         });
     }
+
+    let revocation_feed = match v.get("revocationFeed") {
+        None => None,
+        Some(f) => {
+            let field = |key: &str| {
+                f[key]
+                    .as_str()
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("trust bundle revocationFeed has no {key}"))
+            };
+
+            if f.get("issuer").is_some_and(|i| !i.is_string()) {
+                return Err("trust bundle revocationFeed issuer is not a string".to_string());
+            }
+            Some(BundleFeed {
+                url: field("url")?,
+                identity: field("identity")?,
+                issuer: f["issuer"].as_str().map(str::to_string),
+                root: resolve_root(field("root")?, "revocationFeed")?,
+            })
+        }
+    };
 
     Ok(TrustBundle {
         name: name.to_string(),
@@ -181,6 +218,7 @@ pub fn parse_trust_bundle(name: &str, bytes: &[u8]) -> Result<TrustBundle> {
         expires,
         roots,
         signers,
+        revocation_feed,
     })
 }
 

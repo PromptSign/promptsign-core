@@ -449,7 +449,22 @@ impl MockSigstore {
         at: i64,
         timestamped: bool,
     ) -> Value {
-        let payload_type = "application/vnd.in-toto+json";
+        self.sign_sigstore_certificate_mode_typed(
+            "application/vnd.in-toto+json",
+            payload,
+            at,
+            timestamped,
+        )
+    }
+
+    /// As `sign_sigstore_certificate_mode`, with another DSSE payloadType.
+    pub fn sign_sigstore_certificate_mode_typed(
+        &self,
+        payload_type: &str,
+        payload: &[u8],
+        at: i64,
+        timestamped: bool,
+    ) -> Value {
         let leaf_key = p256::ecdsa::SigningKey::from_slice(&[0x42; 32]).unwrap();
         let leaf = self.leaf_p256(
             7,

@@ -64,7 +64,12 @@ fn roots() -> Value {
 }
 
 fn bundle(version: u64, issued: &str, expires: &str) -> Vec<u8> {
-    let mut bytes = serde_json::to_vec_pretty(&json!({
+    bundle_with_feed(version, issued, expires, None)
+}
+
+/// A bundle that also names a revocation feed (spec/07 §5.1).
+fn bundle_with_feed(version: u64, issued: &str, expires: &str, feed: Option<Value>) -> Vec<u8> {
+    let mut doc = json!({
         "schema": "promptsign/trust-bundle/v1",
         "name": "acme",
         "version": version,
@@ -72,8 +77,13 @@ fn bundle(version: u64, issued: &str, expires: &str) -> Vec<u8> {
         "expires": expires,
         "roots": roots(),
         "signers": [{ "identity": PUBLISH, "issuer": GH, "root": "prod" }],
-    }))
-    .unwrap();
+    });
+
+    if let Some(f) = feed {
+        doc["revocationFeed"] = f;
+    }
+
+    let mut bytes = serde_json::to_vec_pretty(&doc).unwrap();
 
     bytes.push(b'\n');
     bytes
@@ -144,6 +154,34 @@ fn write_trust_root_fixtures() {
         PUBLISH,
         "2026-09-01T00:00:00Z",
     );
+    let feed = |root: &str| {
+        Some(json!({
+            "url": "https://trust.acme.test/revocation.json",
+            "identity": "https://github.com/acme/trust/.github/workflows/revoke.yml@refs/heads/main",
+            "issuer": GH,
+            "root": root,
+        }))
+    };
+    let with_feed = signed_bundle(
+        bundle_with_feed(
+            1,
+            "2026-10-01T00:00:00Z",
+            "2126-01-01T00:00:00Z",
+            feed("prod"),
+        ),
+        PUBLISH,
+        "2026-10-01T00:00:00Z",
+    );
+    let bad_feed = signed_bundle(
+        bundle_with_feed(
+            1,
+            "2026-10-01T00:00:00Z",
+            "2126-01-01T00:00:00Z",
+            feed("staging"),
+        ),
+        PUBLISH,
+        "2026-10-01T00:00:00Z",
+    );
 
     // The README's claims, checked against the core before anything is written.
     let trust = temp_dir("fixtures-check");
@@ -159,6 +197,19 @@ fn write_trust_root_fixtures() {
         "an unlisted signer must not install"
     );
     assert!(check(&stale).is_err(), "an expired bundle must not install");
+    assert!(
+        check(&bad_feed).is_err(),
+        "a feed root the bundle does not hold must not install"
+    );
+    assert_eq!(
+        check(&with_feed)
+            .unwrap()
+            .bundle
+            .revocation_feed
+            .unwrap()
+            .root,
+        "acme/prod"
+    );
     check(&v1).unwrap();
     store(&v1);
     check(&v2).unwrap();
@@ -176,6 +227,8 @@ fn write_trust_root_fixtures() {
     write_bundle(&out, "acme-v2", &v2);
     write_bundle(&out, "acme-v2-unlisted-signer", &unlisted);
     write_bundle(&out, "acme-stale", &stale);
+    write_bundle(&out, "acme-feed", &with_feed);
+    write_bundle(&out, "acme-feed-bad-root", &bad_feed);
     write_artifact(
         &out,
         "prod-signed.txt",
