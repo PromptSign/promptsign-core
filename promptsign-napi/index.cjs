@@ -137,15 +137,22 @@ function withTrustRoot(fn) {
   }
 }
 
+// The native verify calls return { result, evidence }. The evidence rides on
+// the result as a property JSON.stringify skips, so a result still prints
+// exactly as `promptsign verify --json` does.
+function withEvidence({ result, evidence }) {
+  return Object.defineProperty(result, 'evidence', { value: evidence });
+}
+
 /** Verify one target (directory or file). Returns a VerifyResult object,
  * identical to `promptsign verify --json`. */
 function verify(target, opts) {
-  return withTrustRoot(() => JSON.parse(native.verify(target, opts)));
+  return withTrustRoot(() => withEvidence(JSON.parse(native.verify(target, opts))));
 }
 
 /** Verify a tree of roots. Returns an array of VerifyResult. */
 function verifyTree(roots, opts) {
-  return withTrustRoot(() => JSON.parse(native.verifyTreeJson(roots, opts)));
+  return withTrustRoot(() => JSON.parse(native.verifyTreeJson(roots, opts)).map(withEvidence));
 }
 
 /** Offline keyless verification of a bundle. Accepts the bundle as an object or
@@ -184,6 +191,16 @@ function coreVersion() {
   return native.coreVersion();
 }
 
+/** Append decision log records (spec/08) for what a hook did with its
+ * verifications. Writes to the logs the managed and the user policy turn on,
+ * plus `input.decisionLog`. Returns the logs that could not be written. */
+function logDecisions(input) {
+  const entries = (input.entries ?? []).map((e) =>
+    e.result ? { ...e, result: { ...e.result, evidence: e.result.evidence } } : e,
+  );
+  return JSON.parse(native.logDecisions(JSON.stringify({ ...input, entries })));
+}
+
 module.exports = {
   verify,
   verifyTree,
@@ -192,6 +209,7 @@ module.exports = {
   policyLayers,
   strictMode,
   coreVersion,
+  logDecisions,
   trustRoot,
   trustRoots,
 };

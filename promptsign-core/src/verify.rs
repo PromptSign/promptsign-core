@@ -61,14 +61,19 @@ pub struct VerifyResult {
 }
 
 /// What a verification established beyond its verdict, as the decision log
-/// records it (spec/08).
-#[derive(Debug, Clone, Default)]
+/// records it (spec/08). Serialized only by the Node binding, which hands it
+/// back for logging.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Evidence {
     /// sha256 of the DSSE payload, the digest a revocation entry matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_digest: Option<String>,
     /// The policy layer and rule that set the policy's part of the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<DecidingRule>,
     /// Absent when no revocation feed applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation: Option<RevocationState>,
 }
 

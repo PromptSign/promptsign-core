@@ -34,6 +34,19 @@ export interface VerifyResult {
   signed: boolean;
   action: 'pass' | 'warn' | 'fail';
   findings: Finding[];
+  /** What the decision log records beyond the verdict. Not enumerable, so
+   * `JSON.stringify(result)` matches `promptsign verify --json`; pass the
+   * result itself to `logDecisions`. */
+  readonly evidence: Evidence;
+}
+
+export interface Evidence {
+  /** `sha256:<hex>` of the signed payload. */
+  payloadDigest?: string;
+  /** The policy layer and rule that decided. */
+  rule?: { layer: 'managed' | 'user' | 'project'; pattern: string; action: string };
+  /** Absent when no revocation feed applies. */
+  revocation?: 'clear' | 'revoked' | 'stale' | 'unavailable';
 }
 
 export interface KeylessInfo {
@@ -98,6 +111,29 @@ export function trustRoots(): RegistryRoot[];
 
 /** The wrapped promptsign-core version. */
 export function coreVersion(): string;
+
+export type LogEntry =
+  | { result: VerifyResult; decision?: 'allow' | 'block' }
+  | { unresolved: { name: string; message: string }; decision: 'allow' | 'block' }
+  | { error: { name?: string; target?: string; message: string }; decision?: 'allow' | 'block' };
+
+export interface LogInput {
+  /** "claude", "codex" or "openclaw" for a hook. */
+  harness?: string;
+  /** The hook event, e.g. "PreToolUse" or "SessionStart". */
+  event: string;
+  /** A file to log to beside the policies' logs. */
+  decisionLog?: string;
+  /** The policy file `verify` was given, if any. */
+  policyPath?: string;
+  entries: LogEntry[];
+}
+
+/** Append decision log records (spec/08) to the logs the managed and the user
+ * policy turn on and to `decisionLog`. A result may carry the action and
+ * findings the caller settled on. Returns the logs that could not be written;
+ * a failed write never throws. */
+export function logDecisions(input: LogInput): string[];
 
 export interface TrustRootInfo {
   /** Directory holding fulcio.pem and rekor.pub. */

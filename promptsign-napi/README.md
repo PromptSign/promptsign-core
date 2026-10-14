@@ -14,6 +14,7 @@ root pinned in `trust/` — no network call, and nothing to fetch first.
 ```js
 const {
   verify, verifyTree, verifyKeyless, policyShow, policyLayers, strictMode, trustRoots, coreVersion,
+  logDecisions,
 } = require('@promptsign/verify');
 
 // Verify a signed directory or file. Same result as `promptsign verify --json`.
@@ -47,6 +48,18 @@ const strict = strictMode();
 const roots = trustRoots(); // [{ name, kind, fingerprint, subject, managed, expires? }]
 
 coreVersion(); // the wrapped promptsign-core version
+
+// Record what a hook did with each verification in the decision log
+// (spec/08): the logs the managed and the user policy turn on, plus
+// decisionLog. Returns the logs it could not write.
+logDecisions({
+  harness: 'claude',
+  event: 'PreToolUse',
+  entries: [
+    { result, decision: result.action === 'fail' ? 'block' : 'allow' },
+    { unresolved: { name: 'demo:missing', message: 'not found on disk' }, decision: 'allow' },
+  ],
+});
 ```
 
 `verify` also reads OpenSSF Model Signing (OMS) bundles: a directory with
@@ -55,7 +68,9 @@ user's trust roots, and the result carries `format: "oms"` and the `root` it
 chained to. A PromptSign bundle in the same directory takes precedence.
 
 `verify` / `verifyTree` return the same `VerifyResult` shape the CLI emits with
-`--json` (`action` is `"pass" | "warn" | "fail"`; see `index.d.ts`). Policy and 
+`--json` (`action` is `"pass" | "warn" | "fail"`; see `index.d.ts`). Each result
+also carries a non-enumerable `evidence` (payload digest, deciding rule,
+revocation state) that `logDecisions` reads, so pass the result object itself. Policy and 
 Trust-On-First-Use (TOFU) pin resolution follow the same rules as the CLI and 
 honour `PROMPTSIGN_HOME`, unless the machine's managed policy sets `lock_env`.
 

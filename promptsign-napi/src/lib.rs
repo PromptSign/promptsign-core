@@ -10,9 +10,11 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use promptsign_core::verify::{verify_target, VerifyOptions};
+use promptsign_core::decision_log::{self, Context, Decision, Record};
+use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 #[napi(object)]
 pub struct VerifyOpts {
@@ -37,22 +39,113 @@ fn err(e: String) -> Error {
     Error::from_reason(e)
 }
 
-/// Verify one target (directory or file). Returns the VerifyResult as JSON —
-/// identical to `promptsign verify --json`.
+/// `{"result":<VerifyResult>,"evidence":<Evidence>}`: the result exactly as
+/// `promptsign verify --json` prints it, and beside it what
+/// `log_decisions` needs back.
+fn with_evidence(r: &VerifyResult) -> Result<String> {
+    let result = serde_json::to_string(r).map_err(|e| err(e.to_string()))?;
+    let evidence = serde_json::to_string(&r.evidence).map_err(|e| err(e.to_string()))?;
+
+    Ok(format!("{{\"result\":{result},\"evidence\":{evidence}}}"))
+}
+
+/// Verify one target (directory or file). Returns
+/// `{ result, evidence }` as JSON, `result` identical to
+/// `promptsign verify --json`.
 #[napi]
 pub fn verify(target: String, opts: Option<VerifyOpts>) -> Result<String> {
     let r = verify_target(&target, &to_options(opts)).map_err(err)?;
 
-    serde_json::to_string(&r).map_err(|e| err(e.to_string()))
+    with_evidence(&r)
 }
 
-/// Verify a tree of roots. Returns a JSON array of VerifyResult — identical to
-/// `promptsign verify-tree --json`.
+/// Verify a tree of roots. Returns a JSON array of `{ result, evidence }`,
+/// the results identical to `promptsign verify-tree --json`.
 #[napi]
 pub fn verify_tree_json(roots: Vec<String>, opts: Option<VerifyOpts>) -> Result<String> {
     let results = verify_tree(&roots, &to_options(opts)).map_err(err)?;
+    let out = results
+        .iter()
+        .map(with_evidence)
+        .collect::<Result<Vec<_>>>()?;
 
-    serde_json::to_string(&results).map_err(|e| err(e.to_string()))
+    Ok(format!("[{}]", out.join(",")))
+}
+
+fn decision_of(v: &Value) -> Result<Option<Decision>> {
+    match v.as_str() {
+        None => Ok(None),
+        Some("allow") => Ok(Some(Decision::Allow)),
+        Some("block") => Ok(Some(Decision::Block)),
+        Some(other) => Err(err(format!(
+            "decision must be \"allow\" or \"block\", not \"{other}\""
+        ))),
+    }
+}
+
+/// Append decision log records (spec/08) for what a hook did, to the logs
+/// the managed and the user policy turn on and to `decisionLog`, a file of
+/// the caller's own. `input` is JSON:
+///
+/// `{ harness?, event, decisionLog?, policyPath?, entries: [entry] }`, each
+/// entry `{ result, decision? }` (a VerifyResult from `verify`, its action and
+/// findings as the caller settled them), `{ unresolved: { name, message },
+/// decision }` or `{ error: { name?, target?, message }, decision? }`.
+///
+/// Returns a JSON array of the logs that could not be written; a failed
+/// write never throws.
+#[napi]
+pub fn log_decisions(input: String) -> Result<String> {
+    let input: Value =
+        serde_json::from_str(&input).map_err(|e| err(format!("invalid input JSON: {e}")))?;
+    let ctx = Context {
+        verifier: format!("promptsign-verify/{}", env!("CARGO_PKG_VERSION")),
+        harness: input["harness"].as_str().map(str::to_string),
+        event: input["event"]
+            .as_str()
+            .ok_or_else(|| err("event is required".to_string()))?
+            .to_string(),
+    };
+    let mut records = Vec::new();
+
+    for e in input["entries"].as_array().into_iter().flatten() {
+        let decision = decision_of(&e["decision"])?;
+        let text = |v: &Value, key: &str| v[key].as_str().unwrap_or_default().to_string();
+
+        records.push(if e["result"].is_object() {
+            Record::from_json(&ctx, &e["result"], decision)
+        } else if e["unresolved"].is_object() {
+            let u = &e["unresolved"];
+
+            Record::unresolved(
+                &ctx,
+                &text(u, "name"),
+                text(u, "message"),
+                decision.unwrap_or(Decision::Allow),
+            )
+        } else if e["error"].is_object() {
+            let x = &e["error"];
+
+            Record::error(
+                &ctx,
+                &text(x, "name"),
+                x["target"].as_str(),
+                text(x, "message"),
+                decision,
+            )
+        } else {
+            return Err(err(
+                "each entry needs a result, unresolved or error".to_string()
+            ));
+        });
+    }
+
+    let sinks = decision_log::sinks(
+        input["policyPath"].as_str().map(Path::new),
+        input["decisionLog"].as_str().map(Path::new),
+    );
+
+    serde_json::to_string(&decision_log::append(&sinks, &records)).map_err(|e| err(e.to_string()))
 }
 
 /// Offline keyless verification of a bundle (spec/05). Returns

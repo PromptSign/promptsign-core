@@ -12,6 +12,7 @@ use crate::revocation::RevocationState;
 use crate::util::{iso8601_now, promptsign_home};
 use crate::verify::VerifyResult;
 use serde::Serialize;
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -230,6 +231,64 @@ impl Record {
         }
     }
 
+    /// The record of one verification, from a `VerifyResult` in its JSON
+    /// form plus its `evidence`, as the Node binding returns them. A caller
+    /// may have changed the action or added findings before logging it.
+    pub fn from_json(ctx: &Context, r: &Value, decision: Option<Decision>) -> Record {
+        let text = |key: &str| r[key].as_str().map(str::to_string);
+        let evidence = &r["evidence"];
+        let rule = evidence["rule"].as_object().map(|o| DecidingRule {
+            layer: o
+                .get("layer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            pattern: o
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            action: o
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+        let findings = r["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| Finding {
+                level: f["level"].as_str().unwrap_or_default().to_string(),
+                message: f["message"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+
+        Record {
+            target: text("target").map(|t| absolute(&t)),
+            format: text("format"),
+            signed: r["signed"].as_bool().unwrap_or(false),
+            payload_digest: evidence["payloadDigest"].as_str().map(str::to_string),
+            identity: text("identity"),
+            issuer: text("issuer"),
+            root: text("root"),
+            integrated_time: r["integratedTime"].as_i64(),
+            rule,
+            revocation: evidence["revocation"]
+                .as_str()
+                .unwrap_or("unchecked")
+                .to_string(),
+            policy_source: text("policySource"),
+            findings,
+            ..Record::base(
+                ctx,
+                text("name").unwrap_or_default(),
+                r["action"].as_str().unwrap_or("error"),
+                decision,
+            )
+        }
+    }
+
     /// A target the hook could not find on disk, so nothing was verified.
     pub fn unresolved(ctx: &Context, name: &str, message: String, decision: Decision) -> Record {
         Record {
@@ -389,6 +448,51 @@ mod tests {
             r#""harness":"claude","event":"PreToolUse","name":"demo","signed":false,"result":"unresolved","decision":"allow","revocation":"unchecked","findings":[{"level":"warn","message":"not found"}]}"#
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_result_round_trips_through_its_json_form() {
+        let r = VerifyResult {
+            target: "/x/skill".into(),
+            policy_source: "/p.json".into(),
+            name: "acme/skill".into(),
+            version: None,
+            kind: None,
+            identity: Some("alice@acme.test".into()),
+            issuer: Some("https://sso.acme.test".into()),
+            keyid: Some(String::new()),
+            integrated_time: Some(1_790_000_000),
+            format: Some("promptsign".into()),
+            root: Some("acme/prod".into()),
+            signed: true,
+            action: Action::Warn,
+            findings: vec![Finding {
+                level: "warn".into(),
+                message: "m".into(),
+            }],
+            evidence: crate::verify::Evidence {
+                payload_digest: Some("sha256:ab".into()),
+                rule: Some(DecidingRule {
+                    layer: "managed".into(),
+                    pattern: "acme/*".into(),
+                    action: "warn".into(),
+                }),
+                revocation: Some(RevocationState::Stale),
+            },
+        };
+        let mut json = serde_json::to_value(&r).unwrap();
+
+        json["evidence"] = serde_json::to_value(&r.evidence).unwrap();
+
+        let mut direct = Record::verified(&ctx(), &r, Some(Decision::Block));
+        let mut back = Record::from_json(&ctx(), &json, Some(Decision::Block));
+
+        direct.time.clear();
+        back.time.clear();
+        assert_eq!(
+            serde_json::to_string(&direct).unwrap(),
+            serde_json::to_string(&back).unwrap()
+        );
     }
 
     #[test]
