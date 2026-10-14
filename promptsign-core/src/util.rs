@@ -40,10 +40,12 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// `$PROMPTSIGN_HOME`, else `~/.promptsign`. A managed `lock_env` keeps the
+/// default (spec/04).
 pub fn promptsign_home() -> PathBuf {
-    match std::env::var_os("PROMPTSIGN_HOME") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => home_dir().join(".promptsign"),
+    match crate::managed::env_override("PROMPTSIGN_HOME") {
+        Some(p) => PathBuf::from(p),
+        None => home_dir().join(".promptsign"),
     }
 }
 

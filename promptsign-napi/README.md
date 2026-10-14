@@ -12,7 +12,9 @@ root pinned in `trust/` — no network call, and nothing to fetch first.
 ## API
 
 ```js
-const { verify, verifyTree, verifyKeyless, policyShow, trustRoots, coreVersion } = require('@promptsign/verify');
+const {
+  verify, verifyTree, verifyKeyless, policyShow, policyLayers, strictMode, trustRoots, coreVersion,
+} = require('@promptsign/verify');
 
 // Verify a signed directory or file. Same result as `promptsign verify --json`.
 const result = verify('./skills/pdf', { noPinUpdates: true });
@@ -26,14 +28,23 @@ const results = verifyTree(['./skills/pdf', './agents/reviewer.md']);
 // Offline keyless verification of a bundle object/JSON — throws on failure.
 const who = verifyKeyless(bundleJson); // { identity, issuer, keyid, root }
 
-// The user's policy (like `promptsign policy show`). A project's own
-// .promptsign/policy.json can only tighten it.
+// The user's policy. A project's own .promptsign/policy.json can only
+// tighten it.
 const policy = policyShow('.');
 
+// Every policy layer in evaluation order: the machine's managed policy, the
+// user's, the project's. Each later one can only tighten the first.
+const layers = policyLayers('.'); // [{ layer, source, policy }]
+
+// Whether a hook should fail closed: PROMPTSIGN_STRICT=1, or `strict: true`
+// in the managed or the user policy.
+const strict = strictMode();
+
 // Every trust root a signature may chain to: the pinned public Sigstore root,
-// roots added with `promptsign trust add` (~/.promptsign/trust/roots), then
-// the roots of installed trust bundles, named <bundle>/<root>.
-const roots = trustRoots(); // [{ name, kind, fingerprint, subject, expires? }]
+// managed roots and bundles, roots added with `promptsign trust add`
+// (~/.promptsign/trust/roots), then the roots of installed trust bundles,
+// named <bundle>/<root>.
+const roots = trustRoots(); // [{ name, kind, fingerprint, subject, managed, expires? }]
 
 coreVersion(); // the wrapped promptsign-core version
 ```
@@ -46,7 +57,7 @@ chained to. A PromptSign bundle in the same directory takes precedence.
 `verify` / `verifyTree` return the same `VerifyResult` shape the CLI emits with
 `--json` (`action` is `"pass" | "warn" | "fail"`; see `index.d.ts`). Policy and 
 Trust-On-First-Use (TOFU) pin resolution follow the same rules as the CLI and 
-honour `PROMPTSIGN_HOME`.
+honour `PROMPTSIGN_HOME`, unless the machine's managed policy sets `lock_env`.
 
 ## Trust root
 

@@ -4,6 +4,7 @@
 // was valid yesterday can be killed today without any online CA in the hot path.
 
 use crate::keyless::verify_keyless;
+use crate::managed::{env_override, managed_revocation_path};
 use crate::policy::{Action, Finding, Policy};
 use crate::util::{glob_match, parse_duration, parse_iso8601, promptsign_home, sha256_hex};
 use crate::Result;
@@ -60,10 +61,56 @@ pub struct Subject<'a> {
     pub integrated_time: Option<i64>,
 }
 
+/// The file `revoke fetch` caches the feed in: `$PROMPTSIGN_REVOCATION_FILE`
+/// (unless the managed policy locks the environment), else
+/// `~/.promptsign/revocation.json`.
 pub fn feed_path() -> PathBuf {
-    match std::env::var_os("PROMPTSIGN_REVOCATION_FILE") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => promptsign_home().join("revocation.json"),
+    match env_override("PROMPTSIGN_REVOCATION_FILE") {
+        Some(p) => PathBuf::from(p),
+        None => promptsign_home().join("revocation.json"),
+    }
+}
+
+/// The freshest cached feed that verifies under `policy` (spec/06 §4 step
+/// 1): the managed copy an administrator keeps current, or the user's. An
+/// older copy never hides a newer revocation. `Ok(None)` when neither
+/// exists; the first problem when none verifies.
+fn freshest_feed(policy: &Policy) -> std::result::Result<Option<RevocationFeed>, String> {
+    let mut best: Option<RevocationFeed> = None;
+    let mut problem: Option<String> = None;
+
+    for p in [managed_revocation_path(), feed_path()] {
+        if !p.exists() {
+            continue;
+        }
+
+        let loaded = std::fs::read(&p)
+            .map_err(|e| format!("{}: {e}", p.display()))
+            .and_then(|d| {
+                serde_json::from_slice::<Value>(&d).map_err(|e| format!("{}: {e}", p.display()))
+            })
+            .map_err(|e| format!("revocation feed unreadable: {e}"))
+            .and_then(|b| {
+                verify_feed(&b, policy).map_err(|e| format!("revocation feed not trusted: {e}"))
+            });
+
+        match loaded {
+            Ok(feed) => {
+                let at = |f: &RevocationFeed| parse_iso8601(&f.generated_at).unwrap_or(i64::MIN);
+
+                if best.as_ref().is_none_or(|b| at(&feed) > at(b)) {
+                    best = Some(feed);
+                }
+            }
+            Err(e) => {
+                problem.get_or_insert(e);
+            }
+        }
+    }
+    match (best, problem) {
+        (Some(feed), _) => Ok(Some(feed)),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(None),
     }
 }
 
@@ -249,18 +296,14 @@ pub fn evaluate(policy: &Policy, subject: &Subject) -> RevocationOutcome {
         }
     };
 
-    let bundle = match load_cached_feed() {
-        Ok(Some(b)) => b,
+    let feed = match freshest_feed(policy) {
+        Ok(Some(f)) => f,
         Ok(None) => {
             return unavailable(
                 "revocation feed not cached — run `promptsign revoke fetch`".to_string(),
             )
         }
-        Err(e) => return unavailable(format!("revocation feed unreadable: {e}")),
-    };
-    let feed = match verify_feed(&bundle, policy) {
-        Ok(f) => f,
-        Err(e) => return unavailable(format!("revocation feed not trusted: {e}")),
+        Err(e) => return unavailable(e),
     };
 
     // A revoked artifact fails regardless of feed freshness.

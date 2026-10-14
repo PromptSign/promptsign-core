@@ -50,6 +50,8 @@ This project handles the complete verification lifecycle entirely locally:
 
 * **Signature & Integrity Checking** – Validates cryptographic signatures and payloads.
 * **Trust-Policy Evaluation** – Enforces user-defined trust boundaries locally.
+* **Managed Policy and Trust** – Reads an administrator's machine-wide policy, roots
+and trust bundles first; the user's and the project's policies can only tighten them.
 * **Trust-On-First-Use (TOFU) Pins** – Manages local state for initial trust anchors.
 * **Offline Keyless Verification** – Validates certificate chains, transparency-log inclusion
 proofs, and signed entry timestamps without network calls.

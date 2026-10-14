@@ -6,12 +6,15 @@
 // Sigstore's trusted_root.json shape under <trust dir>/roots/<name>.json. A
 // root with transparency logs verifies keyless signatures; a root with
 // certificate authorities only verifies certificate-mode signatures, checked
-// at the current time. Roots come only from the user's trust directory.
+// at the current time. Roots come from the managed trust directory and the
+// user's, never from the directory a verifier checks.
 
 use crate::chain::{is_self_signed, subject_of};
 use crate::keyless::{parse_rekor_logs, trust_dir, RekorLog};
+use crate::managed::managed_trust_dir;
+use crate::policy::load_managed_policy;
 use crate::timestamp::TimestampAuthority;
-use crate::trustbundle::installed_in;
+use crate::trustbundle::{installed_in, Installed};
 use crate::util::{format_iso8601, hex, parse_iso8601, promptsign_home, sha256_hex};
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -98,6 +101,8 @@ pub struct Root {
     pub subject: String,
     /// For a root from a trust bundle, that bundle's expiry (spec/07 §5.6).
     pub expires: Option<i64>,
+    /// True for a root from the managed trust directory (spec/07 §2.4).
+    pub managed: bool,
 }
 
 impl Root {
@@ -128,6 +133,7 @@ impl Root {
             rekor_logs,
             tsas: Vec::new(),
             expires: None,
+            managed: false,
         })
     }
 
@@ -419,13 +425,137 @@ pub fn user_trust_dir() -> PathBuf {
     promptsign_home().join("trust")
 }
 
-/// Every root the user trusts (spec/07 §2): the pinned public root from the
-/// trust directory, the user's named roots, then the roots of each installed
-/// trust bundle.
-pub fn load_registry() -> Result<Vec<Root>> {
-    let pinned: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
+/// True when `dir` holds the built-in root: the pinned pair, the public
+/// `trusted_root.json`, or both.
+fn has_builtin(dir: &Path) -> bool {
+    dir.join("trusted_root.json").exists()
+        || (dir.join("fulcio.pem").exists() && dir.join("rekor.pub").exists())
+}
 
-    registry(&user_trust_dir(), pinned)
+/// The directory the built-in root comes from: the managed trust directory
+/// when it holds one (spec/07 §2.4), else the trust directory.
+pub fn builtin_root_dir() -> PathBuf {
+    let managed = managed_trust_dir();
+
+    if has_builtin(&managed) {
+        return managed;
+    }
+    trust_dir()
+}
+
+/// The built-in root `sigstore-public`, if this machine has one.
+pub fn load_builtin() -> Result<Option<Root>> {
+    let managed = managed_trust_dir();
+
+    if has_builtin(&managed) {
+        return Ok(load_pinned(&managed)?.map(|mut r| {
+            r.managed = true;
+            r
+        }));
+    }
+    load_pinned(&trust_dir())
+}
+
+/// The registry (spec/07 §2) and the trust bundles its roots came from.
+pub struct Registry {
+    pub roots: Vec<Root>,
+    pub bundles: Vec<Installed>,
+    /// The user's roots and bundles the registry left out, and why.
+    pub ignored: Vec<String>,
+}
+
+/// Every root this verifier accepts (spec/07 §2): the built-in root, the
+/// managed named roots and trust bundles, then the user's own, unless the
+/// managed policy sets `user_roots: false`. The registry leaves out a user
+/// root or bundle with the name of a managed one, so a policy rule that names
+/// a managed root can only match that root.
+pub fn load_full_registry(now: i64) -> Result<Registry> {
+    let builtin: Vec<Root> = load_builtin()?.into_iter().collect();
+    let mdir = managed_trust_dir();
+    let mut managed_named = load_named_in(&roots_dir(&mdir))?;
+    let mut managed_bundles = installed_in(&mdir, &builtin, now)?;
+
+    for r in &mut managed_named {
+        r.managed = true;
+    }
+    for b in &mut managed_bundles {
+        b.managed = true;
+        for r in &mut b.bundle.roots {
+            r.managed = true;
+        }
+    }
+
+    let taken: Vec<String> = managed_named
+        .iter()
+        .map(|r| r.name.clone())
+        .chain(managed_bundles.iter().map(|b| b.bundle.name.clone()))
+        .collect();
+    let mut roots = builtin.clone();
+    let mut ignored = Vec::new();
+
+    roots.extend(managed_named);
+    for b in &managed_bundles {
+        roots.extend(b.bundle.roots.iter().cloned());
+    }
+
+    let mut bundles = managed_bundles;
+    let udir = user_trust_dir();
+    let user_roots = load_managed_policy()?.is_none_or(|(p, _, _)| p.user_roots != Some(false));
+
+    if !user_roots {
+        let has_any = |d: PathBuf| fs::read_dir(d).is_ok_and(|mut e| e.next().is_some());
+
+        if has_any(roots_dir(&udir)) || has_any(udir.join("bundles")) {
+            ignored.push(format!(
+                "{}: ignored, the managed policy sets user_roots to false",
+                udir.display()
+            ));
+        }
+        return Ok(Registry {
+            roots,
+            bundles,
+            ignored,
+        });
+    }
+    for r in load_named_in(&roots_dir(&udir))? {
+        if taken.contains(&r.name) {
+            ignored.push(format!(
+                "trust root \"{}\" in {}: ignored, a managed root or bundle has that name",
+                r.name,
+                udir.display()
+            ));
+            continue;
+        }
+        roots.push(r);
+    }
+    for b in installed_in(&udir, &builtin, now)? {
+        if taken.contains(&b.bundle.name) {
+            ignored.push(format!(
+                "trust bundle \"{}\" in {}: ignored, a managed root or bundle has that name",
+                b.bundle.name,
+                udir.display()
+            ));
+            continue;
+        }
+        roots.extend(b.bundle.roots.iter().cloned());
+        bundles.push(b);
+    }
+    Ok(Registry {
+        roots,
+        bundles,
+        ignored,
+    })
+}
+
+/// Every root this verifier accepts: [`load_full_registry`] at the current
+/// time.
+pub fn load_registry() -> Result<Vec<Root>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+
+    Ok(load_full_registry(now)?.roots)
 }
 
 /// Every root in `dir`: the built-in pinned pair first (when present), then

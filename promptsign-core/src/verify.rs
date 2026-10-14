@@ -8,12 +8,10 @@ use crate::manifest::{
 };
 use crate::oms;
 use crate::policy::{
-    evaluate_with_project, load_effective_policy, load_pins, match_rule, save_pins, Action,
-    EffectivePolicy, EvalInput, Finding, Pins, Policy,
+    load_effective_policy, load_pins, save_pins, Action, EffectivePolicy, EvalInput, Finding, Pins,
 };
 use crate::revocation::{self, Subject};
-use crate::trustbundle::installed_user_bundles;
-use crate::trustroot::load_registry;
+use crate::trustroot::{load_full_registry, load_registry};
 use crate::util::format_iso8601;
 use crate::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -93,16 +91,6 @@ fn revocation_subject<'a>(
     }
 }
 
-fn policy_off(policy: &Policy, name: &str) -> bool {
-    let rule = match_rule(policy, name);
-    let level = rule
-        .action
-        .or_else(|| policy.default_action.clone())
-        .unwrap_or_else(|| "warn".to_string());
-
-    level == "off"
-}
-
 /// An `x-promptsign:` marker inside a context-injected file (CLAUDE.md/AGENTS.md)
 /// is never a signature — its presence is a failure. Returns the warning message
 /// for such a file, if it applies.
@@ -141,11 +129,11 @@ fn context_marker_messages(abs: &Path, is_dir: bool) -> Vec<String> {
 }
 
 /// Fold context-injected marker warnings into a result: they add findings and
-/// force at least `Fail` (downgraded to `Warn` only under a policy `off`, so the
-/// warning is surfaced either way).
+/// force at least `Fail`, or `Warn` when every policy layer is `off`, so the
+/// user sees the warning either way.
 fn apply_markers(
     msgs: &[String],
-    policy: &Policy,
+    eff: &EffectivePolicy,
     name: &str,
     findings: &mut Vec<Finding>,
     action: &mut Action,
@@ -154,7 +142,7 @@ fn apply_markers(
         return;
     }
 
-    let off = policy_off(policy, name);
+    let off = eff.off(name);
     let level = if off { "warn" } else { "error" };
 
     for m in msgs {
@@ -173,11 +161,8 @@ fn apply_markers(
 
 pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
     let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    let EffectivePolicy {
-        user: policy,
-        project,
-        source: policy_source,
-    } = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let eff = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let policy_source = eff.source.clone();
     let abs = std::path::absolute(target).map_err(|e| format!("{target}: {e}"))?;
     let md = std::fs::metadata(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
     let is_dir = md.is_dir();
@@ -191,9 +176,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
             return verify_oms(target, opts);
         }
         BundleSource::None => {
-            let out = evaluate_with_project(
-                &policy,
-                project.as_ref(),
+            let out = eff.evaluate(
                 &EvalInput {
                     name: &fallback_name,
                     identity: None,
@@ -209,7 +192,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
 
             apply_markers(
                 &marker_msgs,
-                &policy,
+                &eff,
                 &fallback_name,
                 &mut findings,
                 &mut action,
@@ -232,7 +215,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
             });
         }
         BundleSource::CarriageError(msg) => {
-            let off = policy_off(&policy, &fallback_name);
+            let off = eff.off(&fallback_name);
             let mut action = if off { Action::Warn } else { Action::Fail };
             let mut findings = vec![Finding {
                 level: if off { "warn" } else { "error" }.to_string(),
@@ -241,7 +224,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
 
             apply_markers(
                 &marker_msgs,
-                &policy,
+                &eff,
                 &fallback_name,
                 &mut findings,
                 &mut action,
@@ -271,7 +254,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         Err(e) => {
             return Ok(signature_failure(
                 target,
-                &policy,
+                &eff,
                 policy_source,
                 &marker_msgs,
                 fallback_name,
@@ -318,8 +301,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
     };
     let mut result = finish(
         target,
-        &policy,
-        project.as_ref(),
+        &eff,
         policy_source,
         &marker_msgs,
         opts,
@@ -365,8 +347,7 @@ struct Signed {
 #[allow(clippy::too_many_arguments)]
 fn finish(
     target: &str,
-    policy: &Policy,
-    project: Option<&Policy>,
+    eff: &EffectivePolicy,
     policy_source: String,
     marker_msgs: &[String],
     opts: &VerifyOptions,
@@ -410,9 +391,7 @@ fn finish(
     } else {
         &signed.keyid
     };
-    let out = evaluate_with_project(
-        policy,
-        project,
+    let out = eff.evaluate(
         &EvalInput {
             name: &signed.name,
             identity: Some(&signed.identity),
@@ -429,18 +408,12 @@ fn finish(
         action = out.action;
     }
 
-    apply_markers(
-        marker_msgs,
-        policy,
-        &signed.name,
-        &mut findings,
-        &mut action,
-    );
+    apply_markers(marker_msgs, eff, &signed.name, &mut findings, &mut action);
 
     // Revocation feed (spec/06): "valid yesterday, killed today". Consulted only
     // when a feed is configured; every subject field comes from the
     // authenticated bundle.
-    if policy.revocation_feed.is_some() {
+    if let Some(rev_policy) = eff.revocation() {
         let subject = Subject {
             identity: &signed.identity,
             issuer: signed.issuer.as_deref(),
@@ -448,7 +421,7 @@ fn finish(
             log_index: signed.log_index,
             integrated_time: signed.integrated_time,
         };
-        let rev = revocation::evaluate(policy, &subject);
+        let rev = revocation::evaluate(rev_policy, &subject);
 
         findings.extend(rev.findings);
         if rev.action > action {
@@ -457,7 +430,7 @@ fn finish(
     }
 
     if let Some(root) = signed.root.as_deref() {
-        if let Some(f) = stale_bundle_finding(policy, root)? {
+        if let Some(f) = stale_bundle_finding(eff, root)? {
             if f.level == "error" {
                 action = Action::Fail;
             } else if action < Action::Warn {
@@ -500,9 +473,9 @@ fn finish(
 }
 
 /// A root from a trust bundle past its expiry still verifies, with a finding
-/// whose weight the user policy sets (spec/07 §5.6). Only bundle roots, named
-/// `<bundle>/<root>`, can be stale.
-fn stale_bundle_finding(policy: &Policy, root: &str) -> Result<Option<Finding>> {
+/// whose weight the managed and user policies set (spec/07 §5.6). Only bundle
+/// roots, named `<bundle>/<root>`, can be stale.
+fn stale_bundle_finding(eff: &EffectivePolicy, root: &str) -> Result<Option<Finding>> {
     let Some((bundle, _)) = root.split_once('/') else {
         return Ok(None);
     };
@@ -510,12 +483,13 @@ fn stale_bundle_finding(policy: &Policy, root: &str) -> Result<Option<Finding>> 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
-    let stale = installed_user_bundles(now)?
+    let stale = load_full_registry(now)?
+        .bundles
         .into_iter()
         .find(|i| i.bundle.name == bundle && i.stale);
 
     Ok(stale.map(|i| Finding {
-        level: if policy.on_trust_bundle_stale.as_deref() == Some("fail") {
+        level: if eff.trust_bundle_stale_fails() {
             "error"
         } else {
             "warn"
@@ -532,14 +506,14 @@ fn stale_bundle_finding(policy: &Policy, root: &str) -> Result<Option<Finding>> 
 /// warning even under action "off", a failure under "warn"/"enforce".
 fn signature_failure(
     target: &str,
-    policy: &Policy,
+    eff: &EffectivePolicy,
     policy_source: String,
     marker_msgs: &[String],
     name: String,
     format: &'static str,
     message: String,
 ) -> VerifyResult {
-    let off = policy_off(policy, &name);
+    let off = eff.off(&name);
     let mut action = if off { Action::Warn } else { Action::Fail };
     let mut findings = vec![Finding {
         level: if action == Action::Fail {
@@ -551,7 +525,7 @@ fn signature_failure(
         message,
     }];
 
-    apply_markers(marker_msgs, policy, &name, &mut findings, &mut action);
+    apply_markers(marker_msgs, eff, &name, &mut findings, &mut action);
     VerifyResult {
         target: target.to_string(),
         policy_source,
@@ -575,11 +549,8 @@ fn signature_failure(
 /// markers, revocation and pins as a PromptSign bundle.
 pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
     let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    let EffectivePolicy {
-        user: policy,
-        project,
-        source: policy_source,
-    } = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let eff = load_effective_policy(opts.policy_path.as_deref(), &project_dir)?;
+    let policy_source = eff.source.clone();
     let abs = std::path::absolute(target).map_err(|e| format!("{target}: {e}"))?;
 
     if !abs.is_dir() {
@@ -610,7 +581,7 @@ pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
         Err(e) => {
             return Ok(signature_failure(
                 target,
-                &policy,
+                &eff,
                 policy_source,
                 &marker_msgs,
                 fallback_name,
@@ -635,8 +606,7 @@ pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
 
     finish(
         target,
-        &policy,
-        project.as_ref(),
+        &eff,
         policy_source,
         &marker_msgs,
         opts,

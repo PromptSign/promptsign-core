@@ -8,10 +8,12 @@
 // version names, carry a higher version number, and not have expired.
 
 use crate::bundle::PAYLOAD_TYPE;
-use crate::keyless::{trust_dir, verify_keyless_with};
+use crate::keyless::verify_keyless_with;
+use crate::managed::managed_trust_dir;
 use crate::manifest::Manifest;
 use crate::trustroot::{
-    check_name, load_named_in, load_pinned, roots_dir, user_trust_dir, Root, DEFAULT_ROOT,
+    check_name, load_builtin, load_named_in, load_pinned, roots_dir, user_trust_dir, Root,
+    DEFAULT_ROOT,
 };
 use crate::util::{format_iso8601, glob_match, parse_iso8601, sha256_hex};
 use crate::Result;
@@ -83,6 +85,8 @@ pub struct Installed {
     /// Where `trust fetch` refreshes it from. None for a file install.
     pub source: Option<String>,
     pub stale: bool,
+    /// True for a bundle in the managed trust directory (spec/07 §2.4).
+    pub managed: bool,
 }
 
 /// Parse and check a bundle document (spec/07 §5.1) to be installed as `name`.
@@ -261,6 +265,7 @@ fn load_installed(dir: &Path, name: &str, public: &[Root]) -> Result<Option<(Ins
             bundle,
             source,
             stale: false,
+            managed: false,
         },
         bytes,
     )))
@@ -383,18 +388,57 @@ pub fn check_trust_bundle(
     check_in(dir, &public, &named, name, bytes, sidecar, now)
 }
 
-/// `check_trust_bundle` against the user's trust directory and built-in root.
+/// The user's trust directory, or the managed one.
+pub fn layer_trust_dir(managed: bool) -> PathBuf {
+    if managed {
+        managed_trust_dir()
+    } else {
+        user_trust_dir()
+    }
+}
+
+/// `check_trust_bundle` against the user's (`managed` false) or the managed
+/// trust directory and the built-in root. A user bundle may not take the
+/// name or a root of a managed root or bundle (spec/07 §2.4).
+pub fn check_layer_trust_bundle(
+    managed: bool,
+    name: &str,
+    bytes: &[u8],
+    sidecar: &Value,
+    now: i64,
+) -> Result<Check> {
+    let public: Vec<Root> = load_builtin()?.into_iter().collect();
+    let dir = layer_trust_dir(managed);
+    let mut named = load_named_in(&roots_dir(&dir))?;
+
+    if !managed {
+        let mdir = managed_trust_dir();
+        let mut taken = load_named_in(&roots_dir(&mdir))?;
+
+        for b in installed_in(&mdir, &public, now)? {
+            if b.bundle.name == name {
+                return Err(format!(
+                    "trust bundle \"{name}\" is managed on this machine"
+                ));
+            }
+            taken.extend(b.bundle.roots);
+        }
+        if taken.iter().any(|r| r.name == name) {
+            return Err(format!("\"{name}\" is the name of a managed trust root"));
+        }
+        named.extend(taken);
+    }
+    check_in(&dir, &public, &named, name, bytes, sidecar, now)
+}
+
+/// `check_layer_trust_bundle` for the user's trust directory.
 pub fn check_user_trust_bundle(
     name: &str,
     bytes: &[u8],
     sidecar: &Value,
     now: i64,
 ) -> Result<Check> {
-    let public: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
-    let dir = user_trust_dir();
-    let named = load_named_in(&roots_dir(&dir))?;
-
-    check_in(&dir, &public, &named, name, bytes, sidecar, now)
+    check_layer_trust_bundle(false, name, bytes, sidecar, now)
 }
 
 /// Every installed bundle in `dir`, re-verified, with its staleness at `now`.
@@ -404,11 +448,21 @@ pub fn installed_bundles(dir: &Path, now: i64) -> Result<Vec<Installed>> {
     installed_in(dir, &public, now)
 }
 
+/// `installed_bundles` for the user's (`managed` false) or the managed trust
+/// directory, with the built-in root as the public root.
+pub fn installed_layer_bundles(managed: bool, now: i64) -> Result<Vec<Installed>> {
+    let public: Vec<Root> = load_builtin()?.into_iter().collect();
+    let mut out = installed_in(&layer_trust_dir(managed), &public, now)?;
+
+    for b in &mut out {
+        b.managed = managed;
+    }
+    Ok(out)
+}
+
 /// `installed_bundles` for the user's trust directory.
 pub fn installed_user_bundles(now: i64) -> Result<Vec<Installed>> {
-    let public: Vec<Root> = load_pinned(&trust_dir())?.into_iter().collect();
-
-    installed_in(&user_trust_dir(), &public, now)
+    installed_layer_bundles(false, now)
 }
 
 /// Write a bundle that `check_trust_bundle` accepted. Replaces an installed

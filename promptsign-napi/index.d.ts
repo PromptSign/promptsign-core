@@ -52,6 +52,8 @@ export interface RegistryRoot {
   /** Hex SHA-256 of the anchor certificate. */
   fingerprint: string;
   subject: string;
+  /** From the machine's managed trust directory, which users cannot change. */
+  managed: boolean;
   /** For a trust bundle's root (named `<bundle>/<root>`), the bundle's
    * expiry (RFC 3339). Past it, the bundle is stale until `promptsign trust
    * fetch` refreshes it. */
@@ -72,9 +74,26 @@ export function verifyKeyless(bundle: object | string): KeylessInfo;
  * `.promptsign/policy.json` in `dir` can only tighten it. */
 export function policyShow(dir: string): unknown;
 
-/** Every trust root the verifier accepts: the pinned public root, the user's
- * named roots from `~/.promptsign/trust/roots`, then the roots of installed
- * trust bundles. */
+export interface PolicyLayer {
+  /** "managed" (the machine's, set by an administrator), "user", or
+   * "project" (tighten only). Over a managed policy the user's tightens only. */
+  layer: 'managed' | 'user' | 'project';
+  /** The file the layer came from, or "(built-in default)". */
+  source: string;
+  /** The policy JSON as written. */
+  policy: unknown;
+}
+
+/** Every policy layer that applies in `dir`, in evaluation order. */
+export function policyLayers(dir: string): PolicyLayer[];
+
+/** True when hooks should fail closed: PROMPTSIGN_STRICT=1, or `strict: true`
+ * in the managed or the user policy. */
+export function strictMode(): boolean;
+
+/** Every trust root the verifier accepts: the built-in root, the managed
+ * roots and bundles, then the user's named roots from
+ * `~/.promptsign/trust/roots` and installed trust bundles. */
 export function trustRoots(): RegistryRoot[];
 
 /** The wrapped promptsign-core version. */
@@ -84,11 +103,19 @@ export interface TrustRootInfo {
   /** Directory holding fulcio.pem and rekor.pub. */
   dir: string;
   /**
-   * Why that directory: an explicit `PROMPTSIGN_TRUST_DIR`, a `PROMPTSIGN_HOME`
-   * that takes precedence over the package's own copy, the root `bundled` with
-   * this package, or the core's default location under the user's home.
+   * Why that directory: the machine's `managed` trust directory, the user's
+   * home because the managed policy sets `lock_env`, an explicit
+   * `PROMPTSIGN_TRUST_DIR`, a `PROMPTSIGN_HOME` that takes precedence over the
+   * package's own copy, the root `bundled` with this package, or the core's
+   * default location under the user's home.
    */
-  source: 'PROMPTSIGN_TRUST_DIR' | 'PROMPTSIGN_HOME' | 'bundled' | 'promptsign-home-default';
+  source:
+    | 'managed'
+    | 'lock_env'
+    | 'PROMPTSIGN_TRUST_DIR'
+    | 'PROMPTSIGN_HOME'
+    | 'bundled'
+    | 'promptsign-home-default';
 }
 
 /**

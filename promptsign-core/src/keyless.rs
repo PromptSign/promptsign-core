@@ -139,9 +139,9 @@ pub struct TrustRoot {
 }
 
 pub fn trust_dir() -> PathBuf {
-    match std::env::var_os("PROMPTSIGN_TRUST_DIR") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => promptsign_home().join("trust"),
+    match crate::managed::env_override("PROMPTSIGN_TRUST_DIR") {
+        Some(p) => PathBuf::from(p),
+        None => promptsign_home().join("trust"),
     }
 }
 

@@ -2,6 +2,7 @@
 // A signature without policy is meaningless: anyone can validly sign as
 // themselves. Policy decides which identities may sign which names.
 
+use crate::managed;
 use crate::util::{glob_match, iso8601_now, promptsign_home, short16, write_private};
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,18 @@ pub struct Policy {
     /// root of an expired trust bundle (spec/07 §5.6). User policy only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_trust_bundle_stale: Option<String>,
+    /// Hooks fail closed, as under PROMPTSIGN_STRICT=1. Verifiers read it from
+    /// the managed and the user policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// Managed policy only: ignore the variables in
+    /// [`crate::managed::LOCKED_VARS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_env: Option<bool>,
+    /// Managed policy only: `false` drops the user's own roots and trust
+    /// bundles from the registry (spec/07 §2.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_roots: Option<bool>,
 }
 
 pub fn default_policy() -> Policy {
@@ -74,6 +87,9 @@ pub fn default_policy() -> Policy {
         max_feed_staleness: None,
         on_feed_stale: None,
         on_trust_bundle_stale: None,
+        strict: None,
+        lock_env: None,
+        user_roots: None,
     }
 }
 
@@ -91,21 +107,20 @@ fn read_policy_file(p: &Path) -> Result<(Policy, Value)> {
     Ok((policy, raw))
 }
 
-/// The user's policy (spec/04). Resolution order: explicit path,
-/// $PROMPTSIGN_POLICY, ~/.promptsign/policy.json, built-in default. A project
-/// directory never supplies it: see [`load_project_policy`].
+/// The user's policy file, if the user has one (spec/04). Resolution order:
+/// explicit path, $PROMPTSIGN_POLICY (unless the managed policy locks the
+/// environment), ~/.promptsign/policy.json. A project directory never
+/// supplies it: see [`load_project_policy`].
 /// The raw Value is kept alongside the typed policy so `policy show` can
 /// print unknown fields (revocation_feed, require_attestations, ...) verbatim.
-pub fn load_policy(explicit: Option<&Path>) -> Result<(Policy, Value, String)> {
+pub fn find_user_policy(explicit: Option<&Path>) -> Result<Option<(Policy, Value, String)>> {
     let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
 
     if let Some(p) = explicit {
         candidates.push((p.to_path_buf(), true));
     }
-    if let Ok(env_p) = std::env::var("PROMPTSIGN_POLICY") {
-        if !env_p.is_empty() {
-            candidates.push((PathBuf::from(env_p), false));
-        }
+    if let Some(env_p) = managed::env_override("PROMPTSIGN_POLICY") {
+        candidates.push((PathBuf::from(env_p), false));
     }
     candidates.push((promptsign_home().join("policy.json"), false));
 
@@ -113,17 +128,38 @@ pub fn load_policy(explicit: Option<&Path>) -> Result<(Policy, Value, String)> {
         if p.exists() {
             let (policy, raw) = read_policy_file(&p)?;
 
-            return Ok((policy, raw, p.display().to_string()));
+            return Ok(Some((policy, raw, p.display().to_string())));
         }
         if is_explicit {
             return Err(format!("policy not found: {}", p.display()));
         }
+    }
+    Ok(None)
+}
+
+/// The user's policy file, else the built-in default.
+pub fn load_policy(explicit: Option<&Path>) -> Result<(Policy, Value, String)> {
+    if let Some(found) = find_user_policy(explicit)? {
+        return Ok(found);
     }
 
     let policy = default_policy();
     let raw = serde_json::to_value(&policy).unwrap();
 
     Ok((policy, raw, "(built-in default)".to_string()))
+}
+
+/// The machine's managed policy, if it has one (spec/04 "Managed policy").
+pub fn load_managed_policy() -> Result<Option<(Policy, Value, String)>> {
+    let p = managed::managed_policy_path();
+
+    if !p.exists() {
+        return Ok(None);
+    }
+
+    let (policy, raw) = read_policy_file(&p)?;
+
+    Ok(Some((policy, raw, p.display().to_string())))
 }
 
 pub fn project_policy_path(project_dir: &Path) -> PathBuf {
@@ -145,11 +181,16 @@ pub fn load_project_policy(project_dir: &Path) -> Result<Option<(Policy, Value, 
     Ok(Some((policy, raw, p.display().to_string())))
 }
 
-/// The user's policy plus, when present, the project's tighten-only policy.
+/// The policy layers that apply to one verification, in evaluation order.
+/// Without a managed policy the user's policy is the base (the built-in
+/// default when the user has none). With one, the managed policy is the base
+/// and the user's file, if any, can only tighten it. The project's policy
+/// tightens only.
 pub struct EffectivePolicy {
-    pub user: Policy,
+    pub managed: Option<Policy>,
+    pub user: Option<Policy>,
     pub project: Option<Policy>,
-    /// Display form: the user's source, then the project's when present.
+    /// Display form: each layer's source in evaluation order.
     pub source: String,
 }
 
@@ -157,18 +198,207 @@ pub fn load_effective_policy(
     explicit: Option<&Path>,
     project_dir: &Path,
 ) -> Result<EffectivePolicy> {
-    let (user, _raw, user_source) = load_policy(explicit)?;
-    let project = load_project_policy(project_dir)?;
-    let source = match &project {
-        Some((_, _, p)) => format!("{user_source} + {p} (tighten only)"),
-        None => user_source,
+    let managed = load_managed_policy()?;
+    let user = match managed {
+        Some(_) => find_user_policy(explicit)?,
+        None => Some(load_policy(explicit)?),
     };
+    let project = load_project_policy(project_dir)?;
+    let mut parts = Vec::new();
+
+    if let Some((_, _, p)) = &managed {
+        parts.push(format!("{p} (managed)"));
+    }
+    if let Some((_, _, p)) = &user {
+        parts.push(if managed.is_some() {
+            format!("{p} (tighten only)")
+        } else {
+            p.clone()
+        });
+    }
+    if let Some((_, _, p)) = &project {
+        parts.push(format!("{p} (tighten only)"));
+    }
 
     Ok(EffectivePolicy {
-        user,
+        managed: managed.map(|(p, _, _)| p),
+        user: user.map(|(p, _, _)| p),
         project: project.map(|(p, _, _)| p),
-        source,
+        source: parts.join(" + "),
     })
+}
+
+fn without_tofu(policy: &Policy) -> Policy {
+    let mut p = policy.clone();
+
+    for r in &mut p.rules {
+        r.tofu = None;
+    }
+    p
+}
+
+/// Add a tighten-only layer's findings, prefixed, and keep the worse action.
+fn tighten(out: &mut EvalOutcome, extra: EvalOutcome, prefix: &str) {
+    out.findings
+        .extend(extra.findings.into_iter().map(|f| Finding {
+            level: f.level,
+            message: format!("{prefix}{}", f.message),
+        }));
+    if extra.action > out.action {
+        out.action = extra.action;
+    }
+    if out.pin_update.is_none() {
+        out.pin_update = extra.pin_update;
+    }
+}
+
+impl EffectivePolicy {
+    /// The layer every other one tightens: the managed policy, else the
+    /// user's.
+    pub fn base(&self) -> &Policy {
+        self.managed
+            .as_ref()
+            .or(self.user.as_ref())
+            .expect("an effective policy has a managed or a user layer")
+    }
+
+    /// The user's policy when it sits on a managed one, so tightens only.
+    fn user_over_managed(&self) -> Option<&Policy> {
+        self.managed.as_ref().and(self.user.as_ref())
+    }
+
+    /// Evaluate every layer on one input. The base layer's findings come
+    /// unprefixed, a user policy over a managed one adds `user policy: `
+    /// findings, a project policy adds `project policy: ` ones, and the worst
+    /// action wins. TOFU pins are the user's: the base or the user layer
+    /// checks them once, a project layer never does.
+    pub fn evaluate(&self, input: &EvalInput, pins: &Pins) -> EvalOutcome {
+        let mut out = evaluate(self.base(), input, pins);
+
+        if let Some(user) = self.user_over_managed() {
+            let extra = if out.rule.tofu == Some(true) {
+                evaluate(&without_tofu(user), input, &Pins::new())
+            } else {
+                evaluate(user, input, pins)
+            };
+
+            tighten(&mut out, extra, "user policy: ");
+        }
+        if let Some(project) = &self.project {
+            let extra = evaluate(&without_tofu(project), input, &Pins::new());
+
+            tighten(&mut out, extra, "project policy: ");
+        }
+        out
+    }
+
+    fn layers(&self) -> impl Iterator<Item = &Policy> {
+        [
+            Some(self.base()),
+            self.user_over_managed(),
+            self.project.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// True when every layer switches policy checks off for `name`. Then a
+    /// broken signature or a marker only warns.
+    pub fn off(&self, name: &str) -> bool {
+        self.layers().all(|p| policy_off(p, name))
+    }
+
+    /// The layer whose revocation settings apply (spec/06): the managed
+    /// policy when it names a feed, else the user's. A project's never do.
+    pub fn revocation(&self) -> Option<&Policy> {
+        [self.managed.as_ref(), self.user.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|p| p.revocation_feed.is_some())
+    }
+
+    /// `on_trust_bundle_stale` (spec/07 §5.6): `fail` when the managed or the
+    /// user policy says so.
+    pub fn trust_bundle_stale_fails(&self) -> bool {
+        [self.managed.as_ref(), self.user.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|p| p.on_trust_bundle_stale.as_deref() == Some("fail"))
+    }
+
+    /// `strict: true` in the managed or the user policy.
+    pub fn strict(&self) -> bool {
+        [self.managed.as_ref(), self.user.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|p| p.strict == Some(true))
+    }
+}
+
+/// One policy layer as `policy show` prints it: which layer, the file it came
+/// from, and the file's JSON as written.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerView {
+    /// `managed`, `user` or `project`.
+    pub layer: &'static str,
+    pub source: String,
+    pub policy: Value,
+}
+
+/// Every policy layer in evaluation order (spec/04), for display. Mirrors
+/// [`load_effective_policy`]: the user layer is the built-in default only
+/// when the machine has no managed policy.
+pub fn policy_layers(explicit: Option<&Path>, project_dir: &Path) -> Result<Vec<LayerView>> {
+    let managed = load_managed_policy()?;
+    let user = match managed {
+        Some(_) => find_user_policy(explicit)?,
+        None => Some(load_policy(explicit)?),
+    };
+    let project = load_project_policy(project_dir)?;
+
+    Ok([("managed", managed), ("user", user), ("project", project)]
+        .into_iter()
+        .filter_map(|(layer, found)| {
+            found.map(|(_, policy, source)| LayerView {
+                layer,
+                source,
+                policy,
+            })
+        })
+        .collect())
+}
+
+/// True when the matching rule's action, or the default, is `off`.
+pub fn policy_off(policy: &Policy, name: &str) -> bool {
+    let rule = match_rule(policy, name);
+    let level = rule
+        .action
+        .or_else(|| policy.default_action.clone())
+        .unwrap_or_else(|| "warn".to_string());
+
+    level == "off"
+}
+
+/// True when hooks fail closed: PROMPTSIGN_STRICT=1, or `strict: true` in the
+/// managed or the user policy. A managed policy that does not load counts
+/// as strict; a broken user policy does not.
+pub fn strict_mode() -> bool {
+    if std::env::var("PROMPTSIGN_STRICT").as_deref() == Ok("1") {
+        return true;
+    }
+
+    let managed = match load_managed_policy() {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+
+    if managed
+        .as_ref()
+        .is_some_and(|(p, _, _)| p.strict == Some(true))
+    {
+        return true;
+    }
+    matches!(find_user_policy(None), Ok(Some((p, _, _))) if p.strict == Some(true))
 }
 
 /// First matching rule wins; fall back to the policy default action.
@@ -447,53 +677,14 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
     }
 }
 
-/// Evaluate the user's policy, then the project's on top of it. The project
-/// can only make the outcome stricter: its findings are added and the worse
-/// action wins. It never checks or writes TOFU pins (those are the user's).
-pub fn evaluate_with_project(
-    user: &Policy,
-    project: Option<&Policy>,
-    input: &EvalInput,
-    pins: &Pins,
-) -> EvalOutcome {
-    let mut out = evaluate(user, input, pins);
-
-    if let Some(project) = project {
-        let mut no_tofu = project.clone();
-
-        for r in &mut no_tofu.rules {
-            r.tofu = None;
-        }
-
-        let extra = evaluate(&no_tofu, input, &Pins::new());
-
-        out.findings
-            .extend(extra.findings.into_iter().map(|f| Finding {
-                level: f.level,
-                message: format!("project policy: {}", f.message),
-            }));
-        if extra.action > out.action {
-            out.action = extra.action;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn policy_with(rules: Vec<Rule>) -> Policy {
         Policy {
-            schema: POLICY_SCHEMA.into(),
-            default_action: Some("warn".into()),
             rules,
-            revocation_feed: None,
-            revocation_feed_identity: None,
-            revocation_feed_issuer: None,
-            max_feed_staleness: None,
-            on_feed_stale: None,
-            on_trust_bundle_stale: None,
+            ..default_policy()
         }
     }
 
@@ -919,7 +1110,10 @@ mod tests {
 
         let eff = load_effective_policy(Some(&user_path), &base.join("repo")).unwrap();
 
-        assert_eq!(eff.user.default_action.as_deref(), Some("enforce"));
+        assert_eq!(
+            eff.user.as_ref().unwrap().default_action.as_deref(),
+            Some("enforce")
+        );
         assert_eq!(
             eff.project.as_ref().unwrap().default_action.as_deref(),
             Some("off")
@@ -974,5 +1168,157 @@ mod tests {
 
         assert_eq!(match_rule(&p, "a/x").action.as_deref(), Some("enforce"));
         assert_eq!(match_rule(&p, "b/x").action.as_deref(), Some("off"));
+    }
+
+    fn layered(
+        managed: Option<Policy>,
+        user: Option<Policy>,
+        project: Option<Policy>,
+    ) -> EffectivePolicy {
+        EffectivePolicy {
+            managed,
+            user,
+            project,
+            source: String::new(),
+        }
+    }
+
+    fn signed_by(identity: &str) -> EvalInput<'_> {
+        EvalInput {
+            name: "acme/deploy",
+            identity: Some(identity),
+            keyid: Some("k1"),
+            issuer: None,
+            root: None,
+            signed: true,
+        }
+    }
+
+    fn evaluate_with_project(
+        user: &Policy,
+        project: Option<&Policy>,
+        input: &EvalInput,
+        pins: &Pins,
+    ) -> EvalOutcome {
+        layered(None, Some(user.clone()), project.cloned()).evaluate(input, pins)
+    }
+
+    #[test]
+    fn a_user_policy_cannot_loosen_a_managed_one() {
+        let managed = policy_with(vec![Rule {
+            identity: Some("github:acme-*".into()),
+            ..rule("*", "enforce")
+        }]);
+        let user_off = policy_with(vec![rule("*", "off")]);
+        let eff = layered(Some(managed), Some(user_off), None);
+        let out = eff.evaluate(&signed_by("github:mallory"), &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+        assert!(out.findings[0].message.contains("not allowed"));
+        assert!(!eff.off("acme/deploy"));
+    }
+
+    #[test]
+    fn a_user_policy_tightens_a_managed_one_with_a_prefix() {
+        let managed = policy_with(vec![rule("*", "warn")]);
+        let user = policy_with(vec![Rule {
+            identity: Some("github:acme-*".into()),
+            ..rule("acme/*", "enforce")
+        }]);
+        let eff = layered(Some(managed), Some(user), None);
+        let out = eff.evaluate(&signed_by("github:mallory"), &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+        assert!(out
+            .findings
+            .iter()
+            .any(|f| f.message.starts_with("user policy: identity")));
+    }
+
+    #[test]
+    fn tofu_is_checked_once_across_managed_and_user_layers() {
+        let tofu = |action: &str| {
+            policy_with(vec![Rule {
+                tofu: Some(true),
+                ..rule("*", action)
+            }])
+        };
+        let mut pins = Pins::new();
+
+        pins.insert(
+            "acme/deploy".into(),
+            Pin {
+                name: "acme/deploy".into(),
+                identity: "github:alice".into(),
+                keyid: "k1".into(),
+                issuer: None,
+                first_seen: "2026-10-12T00:00:00Z".into(),
+            },
+        );
+
+        let eff = layered(Some(tofu("warn")), Some(tofu("warn")), None);
+        let out = eff.evaluate(&signed_by("github:bob"), &pins);
+        let mismatches = out
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("TOFU pin mismatch"))
+            .count();
+
+        assert_eq!(out.action, Action::Fail);
+        assert_eq!(mismatches, 1);
+
+        // A managed rule without TOFU leaves the user's pins to the user layer.
+        let eff = layered(
+            Some(policy_with(vec![rule("*", "warn")])),
+            Some(tofu("warn")),
+            None,
+        );
+        let out = eff.evaluate(&signed_by("github:bob"), &pins);
+
+        assert_eq!(out.action, Action::Fail);
+        assert!(out.findings[0]
+            .message
+            .starts_with("user policy: TOFU pin mismatch"));
+    }
+
+    #[test]
+    fn revocation_and_staleness_settings_prefer_the_managed_layer() {
+        let feed = |url: &str| Policy {
+            revocation_feed: Some(url.into()),
+            ..default_policy()
+        };
+        let eff = layered(
+            Some(feed("https://managed")),
+            Some(feed("https://user")),
+            None,
+        );
+
+        assert_eq!(
+            eff.revocation().unwrap().revocation_feed.as_deref(),
+            Some("https://managed")
+        );
+
+        let eff = layered(Some(default_policy()), Some(feed("https://user")), None);
+
+        assert_eq!(
+            eff.revocation().unwrap().revocation_feed.as_deref(),
+            Some("https://user")
+        );
+
+        let stale_fail = Policy {
+            on_trust_bundle_stale: Some("fail".into()),
+            strict: Some(true),
+            ..default_policy()
+        };
+        let eff = layered(Some(default_policy()), Some(stale_fail.clone()), None);
+
+        assert!(eff.trust_bundle_stale_fails());
+        assert!(eff.strict());
+
+        // A project policy sets neither.
+        let eff = layered(None, Some(default_policy()), Some(stale_fail));
+
+        assert!(!eff.trust_bundle_stale_fails());
+        assert!(!eff.strict());
     }
 }

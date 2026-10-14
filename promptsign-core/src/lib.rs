@@ -12,6 +12,7 @@ mod chain;
 pub mod keyless;
 pub mod keys;
 mod logproof;
+pub mod managed;
 pub mod manifest;
 pub mod oms;
 pub mod policy;

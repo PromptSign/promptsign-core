@@ -79,8 +79,15 @@ const hasBundledTrustRoot = () =>
   existsSync(join(BUNDLED_TRUST_DIR, 'fulcio.pem')) &&
   existsSync(join(BUNDLED_TRUST_DIR, 'rekor.pub'));
 
-/** Which root is in effect, and why. Mirrors the core's resolution order. */
+/** Which root is in effect, and why. Mirrors the core's resolution order: a
+ * root in the machine's managed trust directory comes first, and a managed
+ * policy with `lock_env` makes the core ignore the variables below. */
 function trustRoot() {
+  const managed = JSON.parse(native.managedTrust());
+  if (managed.builtinDir) return { dir: managed.builtinDir, source: 'managed' };
+  if (managed.envLocked) {
+    return { dir: join(homedir(), '.promptsign', 'trust'), source: 'lock_env' };
+  }
   if (process.env.PROMPTSIGN_TRUST_DIR) {
     return { dir: process.env.PROMPTSIGN_TRUST_DIR, source: 'PROMPTSIGN_TRUST_DIR' };
   }
@@ -112,6 +119,8 @@ function explainTrustRootError(message) {
     PROMPTSIGN_TRUST_DIR: `PROMPTSIGN_TRUST_DIR points at ${dir}, which takes precedence over the root pinned in this package.`,
     PROMPTSIGN_HOME: `PROMPTSIGN_HOME is set, so the root pinned in this package was not used. Run \`promptsign trust fetch\`, unset PROMPTSIGN_HOME, or set PROMPTSIGN_TRUST_DIR=${BUNDLED_TRUST_DIR}.`,
     bundled: `the pinned root in ${BUNDLED_TRUST_DIR} could not be read — this install may be incomplete.`,
+    managed: `the managed trust directory ${dir} holds a built-in root that could not be read.`,
+    lock_env: `the managed policy sets lock_env, so neither PROMPTSIGN_TRUST_DIR nor the root pinned in this package is used. An administrator can install the public root with \`promptsign trust fetch --managed\`.`,
     'promptsign-home-default': `this install is missing trust/fulcio.pem and trust/rekor.pub, so there is no pinned root to fall back on.`,
   }[source];
   return new Error(`${message}\n@promptsign/verify: ${why}`);
@@ -147,18 +156,30 @@ function verifyKeyless(bundle) {
   );
 }
 
-/** The effective policy for a directory (like `promptsign policy show`). */
+/** The user's policy (like `promptsign policy show`). */
 function policyShow(dir) {
   return JSON.parse(native.policyShow(dir));
 }
 
-/** The wrapped promptsign-core version. */
-/** Every trust root the verifier accepts (pinned public root, then the user's
- * named roots). */
+/** Every policy layer for a directory, in evaluation order: managed, user,
+ * project. */
+function policyLayers(dir) {
+  return JSON.parse(native.policyLayers(dir));
+}
+
+/** True when hooks should fail closed: PROMPTSIGN_STRICT=1, or `strict: true` in
+ * the managed or the user policy. */
+function strictMode() {
+  return native.strictMode();
+}
+
+/** Every trust root the verifier accepts (built-in root, managed roots and
+ * bundles, then the user's). */
 function trustRoots() {
   return withTrustRoot(() => JSON.parse(native.trustRoots()));
 }
 
+/** The wrapped promptsign-core version. */
 function coreVersion() {
   return native.coreVersion();
 }
@@ -168,6 +189,8 @@ module.exports = {
   verifyTree,
   verifyKeyless,
   policyShow,
+  policyLayers,
+  strictMode,
   coreVersion,
   trustRoot,
   trustRoots,
