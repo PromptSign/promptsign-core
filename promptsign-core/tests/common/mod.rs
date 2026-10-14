@@ -70,6 +70,9 @@ pub struct MockSigstore {
     tsa_root_cert: Certificate,
     tsa_key: p256::ecdsa::SigningKey,
     pub tsa_cert: Certificate,
+    /// An intermediate under the CA that issues the leaves instead, as
+    /// Fulcio's online intermediate does under an offline root.
+    intermediate: Option<(p256::ecdsa::SigningKey, Name, Certificate)>,
 }
 
 impl MockSigstore {
@@ -119,6 +122,44 @@ impl MockSigstore {
             tsa_root_cert,
             tsa_key,
             tsa_cert,
+            intermediate: None,
+        }
+    }
+
+    /// As this deployment, with leaves issued by an intermediate the CA
+    /// signs. Bundles then staple leaf, intermediate and CA, and
+    /// `trusted_root` lists the intermediate and the CA in one entry.
+    pub fn with_intermediate(mut self, cn: &str) -> MockSigstore {
+        let key = p256::ecdsa::SigningKey::from_slice(&[0x5a; 32]).unwrap();
+        let name = Name::from_str(&format!("CN={cn},O=promptsign tests")).unwrap();
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            key.verifying_key().to_public_key_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::SubCA {
+                issuer: self.ca_name.clone(),
+                path_len_constraint: Some(0),
+            },
+            SerialNumber::from(1_000u32),
+            validity(1_735_689_600, 4_891_363_200),
+            name.clone(),
+            spki,
+            &self.ca_key,
+        )
+        .unwrap()
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap();
+
+        self.intermediate = Some((key, name, cert));
+        self
+    }
+
+    /// The certificates above a leaf, in chain order.
+    fn issuers(&self) -> Vec<&Certificate> {
+        match &self.intermediate {
+            Some((_, _, cert)) => vec![cert, &self.ca_cert],
+            None => vec![&self.ca_cert],
         }
     }
 
@@ -161,9 +202,9 @@ impl MockSigstore {
             }],
             "certificateAuthorities": [{
                 "subject": { "commonName": "test" },
-                "certChain": { "certificates": [
-                    { "rawBytes": BASE64_STANDARD.encode(self.ca_cert.to_der().unwrap()) }
-                ] }
+                "certChain": { "certificates": self.issuers().iter().map(|c| {
+                    json!({ "rawBytes": BASE64_STANDARD.encode(c.to_der().unwrap()) })
+                }).collect::<Vec<_>>() }
             }],
             "ctlogs": [],
             "timestampAuthorities": []
@@ -209,9 +250,13 @@ impl MockSigstore {
                 .as_bytes(),
         )
         .unwrap();
+        let (issuer_key, issuer_name) = match &self.intermediate {
+            Some((key, name, _)) => (key, name),
+            None => (&self.ca_key, &self.ca_name),
+        };
         let mut leaf = CertificateBuilder::new(
             Profile::Leaf {
-                issuer: self.ca_name.clone(),
+                issuer: issuer_name.clone(),
                 enable_key_agreement: false,
                 enable_key_encipherment: false,
             },
@@ -219,7 +264,7 @@ impl MockSigstore {
             validity(integrated_time - 60, integrated_time + 600),
             Name::from_str("CN=sigstore-intermediate").unwrap(),
             leaf_spki,
-            &self.ca_key,
+            issuer_key,
         )
         .unwrap();
         let san = if identity.contains("://") {
@@ -232,6 +277,16 @@ impl MockSigstore {
         leaf.add_extension(&IssuerExt(issuer.to_string())).unwrap();
 
         let leaf_cert: Certificate = leaf.build::<p256::ecdsa::DerSignature>().unwrap();
+        let mut chain = vec![BASE64_STANDARD.encode(leaf_cert.to_der().unwrap())];
+
+        if self.intermediate.is_some() {
+            chain.extend(
+                self.issuers()
+                    .iter()
+                    .map(|c| BASE64_STANDARD.encode(c.to_der().unwrap())),
+            );
+        }
+
         let sig_b64 = BASE64_STANDARD.encode(leaf_key.sign(&pae(payload_type, payload)).to_bytes());
         let body = json!({
             "apiVersion": "0.0.1",
@@ -267,7 +322,7 @@ impl MockSigstore {
                 "scheme": "keyless",
                 "identity": identity,
                 "issuer": issuer,
-                "certChain": [BASE64_STANDARD.encode(leaf_cert.to_der().unwrap())]
+                "certChain": chain
             },
             "transparency": {
                 "logId": log_id,

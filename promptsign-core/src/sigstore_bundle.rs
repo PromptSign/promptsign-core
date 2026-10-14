@@ -199,7 +199,6 @@ fn verify_certificate_mode(
     now: i64,
 ) -> ModeResult {
     let leaf = &chain[0];
-    let ca = anchored.path.last().ok_or("empty certificate path")?;
     let (times, _) = verified_times(timestamps, &env.sig, anchored.root)?;
 
     // No log witnessed a certificate-mode signature. A timestamp from the
@@ -213,7 +212,7 @@ fn verify_certificate_mode(
 
     for &t in &at {
         check_valid_at(&anchored.path, t)?;
-        if !anchored.root.ca_valid_at(ca, t) {
+        if let Some(ca) = anchored.root.ca_outside_window(&anchored.path, t) {
             return Err(format!(
                 "certificate authority \"{}\" of trust root \"{}\" is outside its validity window at {t}",
                 subject_of(ca),

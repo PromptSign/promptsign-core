@@ -252,6 +252,83 @@ fn write_trust_root_fixtures() {
     );
 }
 
+/// acme's deployment that rotates its Fulcio intermediate under one offline
+/// root: generation 1's entry lists the intermediate and the root and ends on
+/// 2026-07-01; generation 2's entry lists the same root, open-ended.
+fn rotated() -> MockSigstore {
+    MockSigstore::new_valid(
+        60,
+        "acme rotated root",
+        at("2026-01-01T00:00:00Z"),
+        at("2126-01-01T00:00:00Z"),
+    )
+    .with_intermediate("acme rotated intermediate 1")
+}
+
+fn rotated_root(deployment: &MockSigstore) -> Value {
+    let mut doc = deployment.trusted_root();
+    let root = doc["certificateAuthorities"][0]["certChain"]["certificates"][1].clone();
+
+    doc["certificateAuthorities"][0]["validFor"] =
+        json!({ "start": "2026-01-01T00:00:00Z", "end": "2026-07-01T00:00:00Z" });
+    doc["certificateAuthorities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "subject": { "commonName": "acme rotated root" },
+            "certChain": { "certificates": [root] },
+            "validFor": { "start": "2026-07-01T00:00:00Z" }
+        }));
+    doc
+}
+
+#[test]
+#[ignore = "writes fixtures; run with PROMPTSIGN_FIXTURES_OUT set"]
+fn write_rotated_intermediate_fixtures() {
+    let out = std::env::var_os("PROMPTSIGN_FIXTURES_OUT")
+        .map(std::path::PathBuf::from)
+        .expect("set PROMPTSIGN_FIXTURES_OUT to the fixture directory")
+        .join("rotated");
+    let deployment = rotated();
+    let doc = rotated_root(&deployment);
+    let files: [(&str, &[u8], &str); 2] = [
+        (
+            "before-rotation.txt",
+            b"signed through acme's intermediate 1 while it was current
+",
+            "2026-06-01T00:00:00Z",
+        ),
+        (
+            "retired-intermediate.txt",
+            b"signed through acme's intermediate 1 after generation 2 replaced it
+",
+            "2026-08-01T00:00:00Z",
+        ),
+    ];
+    let signed: Vec<Value> = files
+        .iter()
+        .map(|(file, bytes, when)| deployment.sign_file_at(file, bytes, ALICE, ACME_SSO, at(when)))
+        .collect();
+
+    // The README's claims, checked against the core before anything is written.
+    let root = Root::from_trusted_root("acme-rotated", &doc).unwrap();
+
+    assert!(verify_keyless_with(&signed[0], std::slice::from_ref(&root)).is_ok());
+
+    let err = verify_keyless_with(&signed[1], std::slice::from_ref(&root))
+        .err()
+        .expect("a signature from the retired intermediate must fail");
+
+    assert!(err.contains("validity window"), "{err}");
+
+    let _ = fs::remove_dir_all(&out);
+    write_json(&out.join("trusted_root.json"), &doc);
+    for ((file, bytes, _), sidecar) in files.iter().zip(&signed) {
+        fs::write(out.join(file), bytes).unwrap();
+        write_json(&out.join(format!("{file}.psig.json")), sidecar);
+    }
+}
+
 /// acme's Rekor v2 deployment: a CA, a Rekor v1 log, an Ed25519 Rekor v2 log
 /// and a timestamp authority.
 fn v2() -> MockSigstore {

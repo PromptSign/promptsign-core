@@ -352,6 +352,23 @@ impl Root {
             .any(|(c, w)| c.to_der().ok() == der && w.contains(t))
     }
 
+    /// The first certificate on `path` that this root lists but that no
+    /// entry listing it holds valid at `t` (spec/07 §4). Checking every
+    /// listed certificate, not only the top one, keeps a retired
+    /// intermediate retired when a newer entry shares its root.
+    pub(crate) fn ca_outside_window<'c>(
+        &self,
+        path: &'c [Certificate],
+        t: i64,
+    ) -> Option<&'c Certificate> {
+        path.iter().find(|cert| {
+            let der = cert.to_der().ok();
+            let listed = self.ca_certs.iter().any(|c| c.to_der().ok() == der);
+
+            listed && !self.ca_valid_at(cert, t)
+        })
+    }
+
     pub fn is_ca_only(&self) -> bool {
         self.rekor_logs.is_empty()
     }

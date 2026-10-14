@@ -2,6 +2,10 @@
 // a signature was made. Keyless signatures are timed by the log's
 // integratedTime, certificate-mode ones by the current time.
 
+mod common;
+
+use common::MockSigstore;
+use promptsign_core::keyless::verify_keyless_with;
 use promptsign_core::sigstore_bundle::verify_sigstore_bundle;
 use promptsign_core::trustroot::Root;
 use promptsign_core::util::parse_iso8601;
@@ -152,4 +156,51 @@ fn windows_survive_a_round_trip() {
         back["tlogs"][0]["publicKey"]["validFor"]["end"],
         "2026-01-01T00:00:00Z"
     );
+}
+
+#[test]
+fn a_retired_intermediate_stays_retired_under_a_shared_root() {
+    let m = MockSigstore::new(71, "tenant root").with_intermediate("tenant intermediate 1");
+    let retired = parse_iso8601("2026-06-01T00:00:00Z").unwrap();
+    let before = m.sign_payload_at(
+        b"before",
+        "dev@example.com",
+        "https://issuer",
+        retired - 3600,
+    );
+    let after = m.sign_payload_at(
+        b"after",
+        "dev@example.com",
+        "https://issuer",
+        retired + 3600,
+    );
+    let mut doc = m.trusted_root();
+    let root = doc["certificateAuthorities"][0]["certChain"]["certificates"][1].clone();
+
+    // Generation 1's entry ends at retirement. Generation 2's entry lists the
+    // same offline root and is open, as after a tenant rotates its
+    // intermediate.
+    doc["certificateAuthorities"][0]["validFor"] =
+        json!({ "start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z" });
+    doc["certificateAuthorities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "certChain": { "certificates": [root] },
+            "validFor": { "start": "2026-06-01T00:00:00Z" }
+        }));
+
+    let roots = [Root::from_trusted_root("tenant", &doc).unwrap()];
+
+    assert!(
+        verify_keyless_with(&before, &roots).is_ok(),
+        "signed while generation 1 was current"
+    );
+
+    let err = verify_keyless_with(&after, &roots)
+        .err()
+        .expect("signed with the retired intermediate");
+
+    assert!(err.contains("tenant intermediate 1"), "{err}");
+    assert!(err.contains("validity window"), "{err}");
 }

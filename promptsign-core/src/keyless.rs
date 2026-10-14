@@ -331,12 +331,11 @@ pub(crate) fn keyless_roots() -> Result<Vec<Root>> {
     Ok(roots)
 }
 
-/// The validity windows of spec/07 §4 at signing time `t`: the CA the chain
-/// ends at, under any of its entries, and the log key that witnessed it.
+/// The validity windows of spec/07 §4 at signing time `t`: every CA on the
+/// path that the root lists, under any of its entries, and the log key that
+/// witnessed it.
 fn check_windows(a: &Anchored, log: &RekorLog, t: i64) -> Result<()> {
-    let ca = a.path.last().ok_or("empty certificate path")?;
-
-    if !a.root.ca_valid_at(ca, t) {
+    if let Some(ca) = a.root.ca_outside_window(&a.path, t) {
         return Err(format!(
             "certificate authority \"{}\" of trust root \"{}\" was outside its validity window when the signature was made ({t})",
             subject_of(ca),
