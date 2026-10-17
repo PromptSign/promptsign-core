@@ -2,6 +2,7 @@
 // A signature without policy is meaningless: anyone can validly sign as
 // themselves. Policy decides which identities may sign which names.
 
+use crate::approval::Approval;
 use crate::managed;
 use crate::util::{glob_match, iso8601_now, promptsign_home, short16, write_private};
 use crate::Result;
@@ -31,6 +32,68 @@ pub struct Rule {
     pub action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tofu: Option<bool>,
+    /// Approvals the artifact needs (spec/09 §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRule>,
+}
+
+/// A rule's approval requirement (spec/09 §4).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ApprovalRule {
+    pub approvers: Vec<Approver>,
+    /// Distinct approvers required; below 1 counts as 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
+}
+
+/// One accepted approver: globs over the approval signer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Approver {
+    pub identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_root: Option<String>,
+}
+
+impl Approver {
+    fn accepts(&self, a: &Approval) -> bool {
+        glob_match(&self.identity, &a.identity)
+            && self
+                .issuer
+                .as_ref()
+                .is_none_or(|g| glob_match(g, &a.issuer))
+            && self
+                .trust_root
+                .as_ref()
+                .is_none_or(|g| glob_match(g, &a.root))
+    }
+}
+
+impl ApprovalRule {
+    /// The violation message when fewer distinct approvers than the
+    /// threshold accepted `approvals`.
+    fn unmet(&self, name: &str, pattern: &str, approvals: &[Approval]) -> Option<String> {
+        let threshold = self.threshold.unwrap_or(1).max(1) as usize;
+        let mut approvers: Vec<(&str, &str)> = Vec::new();
+
+        for a in approvals {
+            let who = (a.identity.as_str(), a.issuer.as_str());
+
+            if self.approvers.iter().any(|p| p.accepts(a)) && !approvers.contains(&who) {
+                approvers.push(who);
+            }
+        }
+        (approvers.len() < threshold).then(|| {
+            format!(
+                "\"{name}\" has {} of {threshold} required approval{} (rule: {pattern})",
+                approvers.len(),
+                if threshold == 1 { "" } else { "s" }
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +419,13 @@ impl EffectivePolicy {
             .any(|p| p.on_trust_bundle_stale.as_deref() == Some("fail"))
     }
 
+    /// True when some layer's rule for `name` requires approvals, so the
+    /// verifier has to collect them (spec/09).
+    pub fn needs_approvals(&self, name: &str) -> bool {
+        self.layers()
+            .any(|p| match_rule(p, name).approval.is_some())
+    }
+
     /// `strict: true` in the managed or the user policy.
     pub fn strict(&self) -> bool {
         [self.managed.as_ref(), self.user.as_ref()]
@@ -525,6 +595,8 @@ pub struct EvalInput<'a> {
     /// Registry root the signature chained to; absent for keyful bundles.
     pub root: Option<&'a str>,
     pub signed: bool,
+    /// Verified approvals of the artifact's content (spec/09).
+    pub approvals: &'a [Approval],
 }
 
 pub struct EvalOutcome {
@@ -614,15 +686,33 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
         }
     };
 
+    let approval_unmet = rule
+        .approval
+        .as_ref()
+        .and_then(|a| a.unmet(input.name, &rule.pattern, input.approvals));
+
     if !input.signed {
-        violate(
-            format!(
-                "unsigned artifact \"{}\" (rule: {})",
-                input.name, rule.pattern
-            ),
-            &mut findings,
-            &mut action,
-        );
+        // Approvals of the exact bytes stand in for a signature, unless the
+        // rule also constrains the author (spec/09 §4).
+        let author_free = rule.approval.is_some()
+            && rule.identity.is_none()
+            && rule.issuer.is_none()
+            && rule.keyid.is_none()
+            && rule.trust_root.is_none();
+
+        if !author_free {
+            violate(
+                format!(
+                    "unsigned artifact \"{}\" (rule: {})",
+                    input.name, rule.pattern
+                ),
+                &mut findings,
+                &mut action,
+            );
+        }
+        if let Some(message) = approval_unmet {
+            violate(message, &mut findings, &mut action);
+        }
         return EvalOutcome {
             action,
             findings,
@@ -685,6 +775,10 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
                 &mut action,
             );
         }
+    }
+
+    if let Some(message) = approval_unmet {
+        violate(message, &mut findings, &mut action);
     }
 
     let mut pin_update = None;
@@ -763,6 +857,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: false,
+                approvals: &[],
             },
             &Pins::new(),
         );
@@ -783,6 +878,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: false,
+                approvals: &[],
             },
             &Pins::new(),
         );
@@ -808,6 +904,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: true,
+                approvals: &[],
             },
             &Pins::new(),
         );
@@ -823,6 +920,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: true,
+                approvals: &[],
             },
             &Pins::new(),
         );
@@ -843,6 +941,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: true,
+                approvals: &[],
             },
             &pins,
         );
@@ -862,6 +961,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: true,
+                approvals: &[],
             },
             &pins,
         );
@@ -878,6 +978,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: true,
+                approvals: &[],
             },
             &pins,
         );
@@ -897,6 +998,7 @@ mod tests {
             issuer: Some(issuer),
             root: None,
             signed: true,
+            approvals: &[],
         }
     }
 
@@ -1072,6 +1174,7 @@ mod tests {
             issuer: None,
             root: None,
             signed: false,
+            approvals: &[],
         }
     }
 
@@ -1131,6 +1234,86 @@ mod tests {
             evaluate_with_project(&user, None, &unsigned("x"), &Pins::new()).action,
             Action::Warn
         );
+    }
+
+    fn approved_by(identity: &str) -> Approval {
+        Approval {
+            identity: identity.into(),
+            issuer: "https://sso.acme.test".into(),
+            root: "acme".into(),
+            signed_at: None,
+            payload_digest: String::new(),
+            log_index: None,
+        }
+    }
+
+    fn approval_rule(action: &str, threshold: Option<u32>) -> Rule {
+        Rule {
+            approval: Some(ApprovalRule {
+                approvers: vec![Approver {
+                    identity: "*@acme.test".into(),
+                    trust_root: Some("acme".into()),
+                    ..Default::default()
+                }],
+                threshold,
+            }),
+            ..rule("*", action)
+        }
+    }
+
+    #[test]
+    fn approvals_pass_an_unsigned_artifact_only_from_the_base_layer() {
+        let approvals = [approved_by("alice@acme.test")];
+        let input = EvalInput {
+            approvals: &approvals,
+            ..unsigned("x")
+        };
+        let base = policy_with(vec![approval_rule("enforce", None)]);
+
+        assert_eq!(
+            evaluate_with_project(&base, None, &input, &Pins::new()).action,
+            Action::Pass
+        );
+
+        // A project rule that would accept it cannot lift the user's warning.
+        let user = policy_with(vec![rule("*", "warn")]);
+        let project = policy_with(vec![approval_rule("enforce", None)]);
+
+        assert_eq!(
+            evaluate_with_project(&user, Some(&project), &input, &Pins::new()).action,
+            Action::Warn
+        );
+
+        // A project rule asking for more approvals tightens the base.
+        let project = policy_with(vec![approval_rule("enforce", Some(2))]);
+        let out = evaluate_with_project(&base, Some(&project), &input, &Pins::new());
+
+        assert_eq!(out.action, Action::Fail);
+        assert!(out.findings[0]
+            .message
+            .starts_with("project policy: \"x\" has 1 of 2 required approvals"));
+    }
+
+    #[test]
+    fn an_approval_rule_never_needs_zero_approvals() {
+        let p = policy_with(vec![approval_rule("enforce", Some(0))]);
+
+        assert_eq!(
+            evaluate(&p, &unsigned("x"), &Pins::new()).action,
+            Action::Fail
+        );
+
+        // An approver from another root does not count.
+        let elsewhere = Approval {
+            root: "sigstore-public".into(),
+            ..approved_by("alice@acme.test")
+        };
+        let input = EvalInput {
+            approvals: std::slice::from_ref(&elsewhere),
+            ..unsigned("x")
+        };
+
+        assert_eq!(evaluate(&p, &input, &Pins::new()).action, Action::Fail);
     }
 
     #[test]
@@ -1206,6 +1389,7 @@ mod tests {
                 issuer: None,
                 root: None,
                 signed: false,
+                approvals: &[],
             },
             &Pins::new(),
         );
@@ -1254,6 +1438,7 @@ mod tests {
             issuer: None,
             root: None,
             signed: true,
+            approvals: &[],
         }
     }
 

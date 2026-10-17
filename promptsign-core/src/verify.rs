@@ -1,7 +1,9 @@
 // Full verification pipeline for one target:
 //   1. locate bundle   2. verify envelope (crypto)   3. re-verify integrity
-//   against disk   4. evaluate trust policy + TOFU pins.
+//   against disk   4. collect approvals when a rule asks for them
+//   5. evaluate trust policy + TOFU pins.
 
+use crate::approval::{self, Approval, Collected, Listing};
 use crate::bundle::{has_signature_marker, locate_bundle, verify_envelope, BundleSource};
 use crate::manifest::{
     check_file_integrity, check_integrity, strip_md_ext, walk_files, CONTEXT_INJECTED,
@@ -55,6 +57,10 @@ pub struct VerifyResult {
     pub signed: bool,
     pub action: Action,
     pub findings: Vec<Finding>,
+    /// Verified approvals of the artifact's content (spec/09), collected
+    /// when a policy rule for it requires approvals.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<Approval>,
     /// For the decision log; not part of the JSON output.
     #[serde(skip)]
     pub evidence: Evidence,
@@ -75,6 +81,49 @@ pub struct Evidence {
     /// Absent when no revocation feed applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation: Option<RevocationState>,
+}
+
+/// The approvals of the artifact's content, when a layer's rule for `name`
+/// requires them (spec/09); nothing otherwise, so verification without
+/// approval rules reads no extra files. `listing` computes the content
+/// listing.
+fn approvals_for(
+    eff: &EffectivePolicy,
+    name: &str,
+    abs: &Path,
+    is_dir: bool,
+    listing: impl FnOnce() -> Result<Listing>,
+) -> Result<Collected> {
+    if !eff.needs_approvals(name) {
+        return Ok(Collected::default());
+    }
+
+    let listing = match listing() {
+        Ok(l) => l,
+        Err(e) => {
+            return Ok(Collected {
+                approvals: Vec::new(),
+                findings: vec![Finding {
+                    level: "info".to_string(),
+                    message: format!("approvals not checked: {e}"),
+                }],
+            })
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let registry = load_full_registry(now)?;
+    let feed = eff.revocation().and_then(revocation::trusted_feed);
+
+    Ok(approval::collect(
+        &approval::approval_files(abs, is_dir, &listing.digest),
+        &listing.digest,
+        &registry.roots,
+        feed.as_ref(),
+        now,
+    ))
 }
 
 fn basename(p: &Path) -> String {
@@ -197,6 +246,9 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
             return verify_oms(target, opts);
         }
         BundleSource::None => {
+            let approved = approvals_for(&eff, &fallback_name, &abs, is_dir, || {
+                approval::listing_for(&abs)
+            })?;
             let out = eff.evaluate(
                 &EvalInput {
                     name: &fallback_name,
@@ -205,10 +257,13 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                     issuer: None,
                     root: None,
                     signed: false,
+                    approvals: &approved.approvals,
                 },
                 &Pins::new(),
             );
-            let mut findings = out.findings;
+            let mut findings = approved.findings;
+
+            findings.extend(out.findings);
             let mut action = out.action;
             let evidence = Evidence {
                 rule: out.decided_by,
@@ -237,6 +292,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 signed: false,
                 action,
                 findings,
+                approvals: approved.approvals,
                 evidence,
             });
         }
@@ -270,6 +326,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
                 signed: true,
                 action,
                 findings,
+                approvals: Vec::new(),
                 evidence: Evidence::default(),
             });
         }
@@ -312,6 +369,14 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         action = Action::Fail;
     }
 
+    // A tampered artifact fails whatever its approvals say, so skip them.
+    let approved = if action == Action::Fail {
+        Collected::default()
+    } else {
+        approvals_for(&eff, &manifest.name, &abs, is_dir, || {
+            Ok(approval::listing_of(&manifest.files))
+        })?
+    };
     let subject = revocation_subject(&bundle_value, "", None, envelope.signed_at);
     let signed = Signed {
         name: manifest.name,
@@ -333,6 +398,7 @@ pub fn verify_target(target: &str, opts: &VerifyOptions) -> Result<VerifyResult>
         &marker_msgs,
         opts,
         signed,
+        approved,
         findings,
         action,
     )?;
@@ -379,6 +445,7 @@ fn finish(
     marker_msgs: &[String],
     opts: &VerifyOptions,
     signed: Signed,
+    approved: Collected,
     mut findings: Vec<Finding>,
     mut action: Action,
 ) -> Result<VerifyResult> {
@@ -407,6 +474,7 @@ fn finish(
             signed: true,
             action,
             findings,
+            approvals: Vec::new(),
             evidence: Evidence {
                 payload_digest: Some(signed.payload_digest),
                 ..Default::default()
@@ -430,10 +498,12 @@ fn finish(
             issuer: signed.issuer.as_deref(),
             root: signed.root.as_deref(),
             signed: true,
+            approvals: &approved.approvals,
         },
         &pins,
     );
 
+    findings.extend(approved.findings);
     findings.extend(out.findings);
     if out.action > action {
         action = out.action;
@@ -503,6 +573,7 @@ fn finish(
         signed: true,
         action,
         findings,
+        approvals: approved.approvals,
         evidence: Evidence {
             payload_digest: Some(signed.payload_digest),
             rule: out.decided_by,
@@ -580,6 +651,7 @@ fn signature_failure(
         signed: true,
         action,
         findings,
+        approvals: Vec::new(),
         evidence: Evidence::default(),
     }
 }
@@ -630,6 +702,11 @@ pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
             ))
         }
     };
+    let approved = if out.action == Action::Fail {
+        Collected::default()
+    } else {
+        approvals_for(&eff, &out.name, &abs, true, || approval::listing_for(&abs))?
+    };
     let signed = Signed {
         name: out.name,
         version: None,
@@ -651,6 +728,7 @@ pub fn verify_oms(target: &str, opts: &VerifyOptions) -> Result<VerifyResult> {
         &marker_msgs,
         opts,
         signed,
+        approved,
         out.findings,
         out.action,
     )

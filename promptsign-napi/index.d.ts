@@ -34,10 +34,24 @@ export interface VerifyResult {
   signed: boolean;
   action: 'pass' | 'warn' | 'fail';
   findings: Finding[];
+  /** Verified approvals of the artifact's content (spec/09), present when a
+   * policy rule for it requires approvals and some verified. */
+  approvals?: Approval[];
   /** What the decision log records beyond the verdict. Not enumerable, so
    * `JSON.stringify(result)` matches `promptsign verify --json`; pass the
    * result itself to `logDecisions`. */
   readonly evidence: Evidence;
+}
+
+export interface Approval {
+  /** The approver: a certificate's SAN, or its subject DN in certificate mode. */
+  identity: string;
+  /** OIDC issuer, or `x509:sha256:<root fingerprint>` in certificate mode. */
+  issuer: string;
+  /** Trust root the approval chained to. */
+  root: string;
+  /** When the approver signed, in Unix seconds, if the signature proves it. */
+  signedAt?: number;
 }
 
 export interface Evidence {

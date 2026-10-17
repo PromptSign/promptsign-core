@@ -470,6 +470,7 @@ mod tests {
                 level: "warn".into(),
                 message: "m".into(),
             }],
+            approvals: Vec::new(),
             evidence: crate::verify::Evidence {
                 payload_digest: Some("sha256:ab".into()),
                 rule: Some(DecidingRule {

@@ -284,6 +284,13 @@ pub fn verify_feed_with(
     Ok(feed)
 }
 
+/// The freshest cached feed that verifies under `policy`, for subjects
+/// beyond the artifact's own signature, such as its approvals (spec/09 §5).
+/// `None` when no copy verifies; the artifact's own check reports why.
+pub fn trusted_feed(policy: &Policy) -> Option<RevocationFeed> {
+    freshest_feed(policy).ok().flatten()
+}
+
 /// Match the subject against every feed entry. Returns the first matching entry's
 /// reason string (spec/06 §1.1, §4.3). `None` = not revoked.
 pub fn check_revocation(feed: &RevocationFeed, subject: &Subject) -> Option<String> {

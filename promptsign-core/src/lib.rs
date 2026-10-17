@@ -6,6 +6,7 @@
 // Errors are plain strings: every failure ultimately surfaces as a one-line
 // CLI/hook message, matching the Node implementation's Error.message model.
 
+pub mod approval;
 pub mod bundle;
 pub mod canonicalize;
 mod chain;
