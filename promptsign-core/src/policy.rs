@@ -28,6 +28,9 @@ pub struct Rule {
     /// chain to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_root: Option<String>,
+    /// Alternative signers: the signature must satisfy at least one entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signers: Option<Vec<Signer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +38,37 @@ pub struct Rule {
     /// Approvals the artifact needs (spec/09 §4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalRule>,
+}
+
+/// One entry of a rule's `signers`. A signature matches it when it satisfies
+/// every key the entry sets, each checked as the rule key of the same name.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Signer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_root: Option<String>,
+}
+
+impl Signer {
+    fn accepts(&self, input: &EvalInput) -> bool {
+        let glob = |g: &Option<String>, v: Option<&str>| {
+            g.as_ref().is_none_or(|g| glob_match(g, v.unwrap_or("")))
+        };
+
+        glob(&self.identity, input.identity)
+            && glob(&self.issuer, input.issuer)
+            && glob(&self.trust_root, input.root)
+            && self
+                .keyid
+                .as_ref()
+                .is_none_or(|k| k == input.keyid.unwrap_or(""))
+    }
 }
 
 /// A rule's approval requirement (spec/09 §4).
@@ -698,7 +732,8 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
             && rule.identity.is_none()
             && rule.issuer.is_none()
             && rule.keyid.is_none()
-            && rule.trust_root.is_none();
+            && rule.trust_root.is_none()
+            && rule.signers.is_none();
 
         if !author_free {
             violate(
@@ -771,6 +806,22 @@ pub fn evaluate(policy: &Policy, input: &EvalInput, pins: &Pins) -> EvalOutcome 
         if rule_keyid != keyid {
             violate(
                 format!("keyid {}… does not match pinned rule keyid", short16(keyid)),
+                &mut findings,
+                &mut action,
+            );
+        }
+    }
+    if let Some(signers) = &rule.signers {
+        if !signers.iter().any(|s| s.accepts(input)) {
+            violate(
+                format!(
+                    "signer \"{identity}\" (issuer \"{}\", trust root \"{}\") matches none of the {} signers allowed for \"{}\" (rule: {})",
+                    input.issuer.unwrap_or(""),
+                    input.root.unwrap_or(""),
+                    signers.len(),
+                    input.name,
+                    rule.pattern
+                ),
                 &mut findings,
                 &mut action,
             );
@@ -1132,6 +1183,81 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn signers_rule_passes_any_listed_signer_and_keeps_the_rule_keys() {
+        let p: Policy = serde_json::from_value(serde_json::json!({
+            "schema": POLICY_SCHEMA,
+            "rules": [{
+                "pattern": "*",
+                "issuer": "https://sso.acme.test",
+                "signers": [
+                    { "identity": "*@acme.test", "trust_root": "acme/*" },
+                    { "identity": "*@partner.test", "trust_root": "partner/*" }
+                ],
+                "action": "enforce"
+            }]
+        }))
+        .unwrap();
+        let eval = |identity, issuer, root| {
+            let input = EvalInput {
+                root: Some(root),
+                ..keyless_input(identity, issuer)
+            };
+
+            evaluate(&p, &input, &Pins::new())
+        };
+        let ours = "https://sso.acme.test";
+
+        assert_eq!(
+            eval("alice@acme.test", ours, "acme/prod").action,
+            Action::Pass
+        );
+        assert_eq!(
+            eval("bob@partner.test", ours, "partner/prod").action,
+            Action::Pass
+        );
+
+        let crossed = eval("bob@partner.test", ours, "acme/prod");
+
+        assert_eq!(crossed.action, Action::Fail);
+        assert!(
+            crossed.findings[0]
+                .message
+                .contains("matches none of the 2 signers"),
+            "{:?}",
+            crossed.findings
+        );
+        assert_eq!(
+            eval("eve@evil.test", ours, "acme/prod").action,
+            Action::Fail
+        );
+        assert_eq!(
+            eval("alice@acme.test", "https://other.test", "acme/prod").action,
+            Action::Fail
+        );
+    }
+
+    #[test]
+    fn a_signers_rule_keeps_unsigned_approved_artifacts_out() {
+        let p = policy_with(vec![Rule {
+            signers: Some(vec![Signer {
+                identity: Some("*@acme.test".into()),
+                ..Default::default()
+            }]),
+            ..approval_rule("enforce", None)
+        }]);
+        let out = evaluate(
+            &p,
+            &EvalInput {
+                approvals: &[approved_by("carol@acme.test")],
+                ..unsigned("s")
+            },
+            &Pins::new(),
+        );
+
+        assert_eq!(out.action, Action::Fail);
     }
 
     #[test]
