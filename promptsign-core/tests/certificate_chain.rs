@@ -1,6 +1,7 @@
 // Certificate-mode path rules with a synthetic PKI: only CA certificates may
 // issue, and path length limits hold. An enterprise CA issues many ordinary
-// certificates; none of them may mint a signing certificate of its own.
+// certificates; none of them may mint a signing certificate of its own. The
+// signer identity comes from the leaf's SAN when it names a person.
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use p256::ecdsa::signature::Signer as _;
@@ -13,7 +14,10 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::der::asn1::{Any, Ia5String, ObjectIdentifier, Utf8StringRef};
 use x509_cert::der::{Decode, Encode, EncodePem};
+use x509_cert::ext::pkix::name::{GeneralName, OtherName};
+use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
@@ -204,4 +208,85 @@ fn path_length_limits_hold() {
         .unwrap_err();
 
     assert!(err.contains("allows 0"), "{err}");
+}
+
+/// A leaf the root issues with `names` in its SAN, as AD CS issues a user's
+/// code-signing certificate.
+fn leaf_with_san(
+    p: &Pki,
+    subject: &str,
+    names: Vec<GeneralName>,
+    seed: u8,
+) -> (Certificate, SigningKey) {
+    let leaf_key = key(seed);
+    let mut builder = CertificateBuilder::new(
+        leaf_profile("CN=Corp Root,O=Corp"),
+        SerialNumber::from(u32::from(seed)),
+        Validity::from_now(Duration::from_secs(3600)).unwrap(),
+        Name::from_str(subject).unwrap(),
+        spki(&leaf_key),
+        &p.root_key,
+    )
+    .unwrap();
+
+    if !names.is_empty() {
+        builder.add_extension(&SubjectAltName(names)).unwrap();
+    }
+    (builder.build::<DerSignature>().unwrap(), leaf_key)
+}
+
+fn upn(name: &str) -> GeneralName {
+    GeneralName::OtherName(OtherName {
+        type_id: ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.20.2.3"),
+        value: Any::encode_from(&Utf8StringRef::new(name).unwrap()).unwrap(),
+    })
+}
+
+fn email(name: &str) -> GeneralName {
+    GeneralName::Rfc822Name(Ia5String::new(name).unwrap())
+}
+
+fn identity_of(subject: &str, names: Vec<GeneralName>, seed: u8) -> String {
+    let p = pki();
+    let (leaf, leaf_key) = leaf_with_san(&p, subject, names, seed);
+    let v = verify_sigstore_bundle(&bundle(&[&leaf], &leaf_key), &[p.root], now()).unwrap();
+
+    assert_eq!(v.mode, SignerMode::Certificate);
+    assert!(v.issuer.starts_with("x509:sha256:"), "{}", v.issuer);
+    v.identity
+}
+
+#[test]
+fn the_signer_identity_comes_from_the_san_when_it_names_a_person() {
+    let ad = "CN=Alice Smith,OU=Engineering,DC=corp,DC=local";
+
+    // An email address wins over the UPN, wherever it sits in the SAN.
+    assert_eq!(
+        identity_of(
+            ad,
+            vec![upn("asmith@corp.local"), email("alice@corp.com")],
+            9
+        ),
+        "alice@corp.com"
+    );
+    // AD CS user templates can carry the UPN alone.
+    assert_eq!(
+        identity_of(ad, vec![upn("asmith@corp.local")], 10),
+        "asmith@corp.local"
+    );
+    // A SAN without either, or no SAN, leaves the subject DN.
+    assert_eq!(
+        identity_of(
+            ad,
+            vec![GeneralName::DnsName(
+                Ia5String::new("build01.corp.local").unwrap()
+            )],
+            11
+        ),
+        "CN=Alice Smith,OU=Engineering,DC=corp,DC=local"
+    );
+    assert_eq!(
+        identity_of(ad, vec![], 12),
+        "CN=Alice Smith,OU=Engineering,DC=corp,DC=local"
+    );
 }

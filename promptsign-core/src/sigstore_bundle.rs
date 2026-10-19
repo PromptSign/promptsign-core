@@ -11,7 +11,8 @@
 // in-toto Statement to files is the caller's job.
 
 use crate::chain::{
-    anchor_chain, check_signing_leaf, check_valid_at, spki_der_of, subject_of, Anchored,
+    anchor_chain, certificate_identity, check_signing_leaf, check_valid_at, spki_der_of,
+    subject_of, Anchored,
 };
 use crate::keyless::{
     b64_list, verified_times, verify_keyless_parts, EnvelopeSig, LogProof, TlogEntry,
@@ -37,7 +38,7 @@ pub enum SignerMode {
 pub struct VerifiedStatement {
     pub mode: SignerMode,
     /// Keyless: the certificate's SAN identity. Certificate mode: the leaf's
-    /// subject DN.
+    /// SAN email, else its user principal name, else its subject DN.
     pub identity: String,
     /// Keyless: the OIDC issuer. Certificate mode: `x509:sha256:<root fp>`.
     pub issuer: String,
@@ -224,7 +225,7 @@ fn verify_certificate_mode(
     env.verify_by(leaf)?;
     Ok((
         SignerMode::Certificate,
-        subject_of(leaf),
+        certificate_identity(leaf),
         String::new(),
         times.iter().copied().min(),
         None,

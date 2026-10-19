@@ -98,8 +98,8 @@ pub fn statement(name: &str, digest: &str, approved_at: &str, note: Option<&str>
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
-    /// The approver: a certificate's SAN, or its subject DN in certificate
-    /// mode.
+    /// The approver: a certificate's SAN identity. In certificate mode, its
+    /// SAN email, else its user principal name, else its subject DN.
     pub identity: String,
     /// OIDC issuer, or `x509:sha256:<root fingerprint>` in certificate mode.
     pub issuer: String,

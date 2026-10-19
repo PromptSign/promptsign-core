@@ -4,12 +4,14 @@
 
 use crate::trustroot::Root;
 use crate::Result;
+use der::asn1::Utf8StringRef;
 use der::oid::ObjectIdentifier;
 use der::{Decode, Encode};
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::pkcs8::DecodePublicKey as _;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAltName};
 use x509_cert::Certificate;
 
 const OID_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
@@ -28,6 +30,9 @@ const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15"
 const OID_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 const OID_EKU_CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
 const OID_EKU_ANY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37.0");
+const OID_SAN: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
+/// Microsoft's user principal name, an otherName in the SAN.
+const OID_UPN: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.20.2.3");
 pub(crate) const OID_SHA256: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 pub(crate) const OID_SHA384: ObjectIdentifier =
@@ -44,6 +49,41 @@ pub(crate) fn spki_der_of(cert: &Certificate) -> Result<Vec<u8>> {
 
 pub(crate) fn subject_of(cert: &Certificate) -> String {
     cert.tbs_certificate.subject.to_string()
+}
+
+/// A certificate-mode signer's identity (spec/07 §3.2): the SAN's first
+/// email address, else its Microsoft user principal name, else the subject
+/// DN. Enterprise CAs (AD CS, most code-signing CAs) put the person in the
+/// SAN, so policies match `alice@corp.com` as they do for keyless signers.
+pub(crate) fn certificate_identity(cert: &Certificate) -> String {
+    let names = cert
+        .tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .find(|e| e.extn_id == OID_SAN)
+        .and_then(|e| SubjectAltName::from_der(e.extn_value.as_bytes()).ok())
+        .map(|san| san.0)
+        .unwrap_or_default();
+    let email = names.iter().find_map(|n| match n {
+        GeneralName::Rfc822Name(s) => Some(s.to_string()),
+        _ => None,
+    });
+    let upn = || {
+        names.iter().find_map(|n| match n {
+            GeneralName::OtherName(o) if o.type_id == OID_UPN => o
+                .value
+                .decode_as::<Utf8StringRef>()
+                .ok()
+                .map(|s| s.as_str().to_string()),
+            _ => None,
+        })
+    };
+
+    email
+        .filter(|s| !s.is_empty())
+        .or_else(|| upn().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| subject_of(cert))
 }
 
 fn ec_curve(cert: &Certificate) -> Result<ObjectIdentifier> {

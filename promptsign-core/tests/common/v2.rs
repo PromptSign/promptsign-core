@@ -372,6 +372,18 @@ impl MockSigstore {
         issuer: &str,
         at: i64,
     ) -> Value {
+        self.sign_typed_payload_v2_at(PAYLOAD_TYPE, payload, identity, issuer, at)
+    }
+
+    /// As `sign_payload_v2_at`, with another DSSE payloadType.
+    pub fn sign_typed_payload_v2_at(
+        &self,
+        payload_type: &str,
+        payload: &[u8],
+        identity: &str,
+        issuer: &str,
+        at: i64,
+    ) -> Value {
         let serial = self.serial.get();
 
         self.serial.set(serial + 1);
@@ -380,14 +392,14 @@ impl MockSigstore {
             p256::ecdsa::SigningKey::from_slice(&[(serial % 100) as u8 + 1; 32]).unwrap();
         let leaf = self.leaf_p256(serial, &leaf_key, identity, issuer, at);
         let leaf_der = leaf.to_der().unwrap();
-        let sig: p256::ecdsa::DerSignature = leaf_key.sign(&pae(PAYLOAD_TYPE, payload));
+        let sig: p256::ecdsa::DerSignature = leaf_key.sign(&pae(payload_type, payload));
         let body = json!({
             "apiVersion": "0.0.2",
             "kind": "hashedrekord",
             "spec": { "hashedRekordV002": {
                 "data": {
                     "algorithm": "SHA2_256",
-                    "digest": BASE64_STANDARD.encode(Sha256::digest(pae(PAYLOAD_TYPE, payload)))
+                    "digest": BASE64_STANDARD.encode(Sha256::digest(pae(payload_type, payload)))
                 },
                 "signature": {
                     "content": BASE64_STANDARD.encode(sig.as_bytes()),
@@ -415,7 +427,7 @@ impl MockSigstore {
         json!({
             "schema": "promptsign/bundle/v1",
             "envelope": {
-                "payloadType": PAYLOAD_TYPE,
+                "payloadType": payload_type,
                 "payload": BASE64_STANDARD.encode(payload),
                 "signatures": [{ "keyid": sha256_hex(leaf.tbs_certificate.subject_public_key_info.to_der().unwrap().as_slice()), "sig": BASE64_STANDARD.encode(sig.as_bytes()) }]
             },

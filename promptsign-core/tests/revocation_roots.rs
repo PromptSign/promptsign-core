@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 const ALICE: &str = "alice@acme.test";
 const SSO: &str = "https://sso.acme.test";
-/// The subject DN of the mock's certificate-mode leaf.
-const CA_LEAF: &str = "CN=sigstore-intermediate";
+/// The certificate-mode signer identity: the SAN email of the mock's leaf.
+const CA_LEAF: &str = "builder@acme.test";
 
 fn t0() -> i64 {
     parse_iso8601("2026-10-01T12:00:00Z").unwrap()

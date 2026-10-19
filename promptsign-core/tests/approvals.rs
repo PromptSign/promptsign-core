@@ -21,7 +21,8 @@ use std::path::Path;
 const ALICE: &str = "alice@acme.test";
 const BOB: &str = "bob@acme.test";
 const SSO: &str = "https://sso.acme.test";
-const CA_LEAF: &str = "CN=sigstore-intermediate";
+/// The certificate-mode signer identity: the SAN email of the mock's leaf.
+const CA_LEAF: &str = "builder@acme.test";
 const DIGEST: &str = "4f3c2a8d1e9b7c6a5f4e3d2c1b0a99887766554433221100ffeeddccbbaa9988";
 
 fn t0() -> i64 {

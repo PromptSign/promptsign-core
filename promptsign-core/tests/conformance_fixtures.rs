@@ -1,9 +1,10 @@
-// Writes the shared trust-root and Rekor v2 fixtures (spec/07 §6) that every
-// implementation runs its conformance checks on. Ignored by default;
-// regenerate with
+// Writes the shared trust-root, Rekor v2 and approval fixtures (spec/07 §6,
+// spec/09) that every implementation runs its conformance checks on. Ignored
+// by default; regenerate with
 //
 //   PROMPTSIGN_FIXTURES_OUT=../../spec/test/fixtures/trust-roots \
 //   PROMPTSIGN_REKOR_V2_FIXTURES_OUT=../../spec/test/fixtures/rekor-v2 \
+//   PROMPTSIGN_APPROVAL_FIXTURES_OUT=../../spec/test/fixtures/approvals \
 //     cargo test --test conformance_fixtures -- --ignored
 //
 // Every certificate, log entry and bundle carries a fixed time, and the mock's
@@ -489,4 +490,108 @@ fn write_rekor_v2_fixtures() {
             &c.sidecar,
         );
     }
+}
+
+/// A native keyless bundle in Sigstore's bundle v0.3 carriage, as cosign
+/// writes it: the leaf certificate, the Rekor v2 entry with its checkpoint,
+/// and the timestamps.
+fn to_sigstore(native: &Value) -> Value {
+    let t = &native["transparency"];
+    let p = &t["inclusionProof"];
+    let log_id: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&t["logId"].as_str().unwrap()[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+
+    json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {
+            "certificate": { "rawBytes": native["signer"]["certChain"][0] },
+            "tlogEntries": [{
+                "logIndex": t["logIndex"].to_string(),
+                "logId": { "keyId": BASE64_STANDARD.encode(log_id) },
+                "kindVersion": { "kind": "hashedrekord", "version": "0.0.2" },
+                "inclusionProof": {
+                    "logIndex": t["logIndex"].to_string(),
+                    "rootHash": p["rootHash"],
+                    "treeSize": p["treeSize"].to_string(),
+                    "hashes": p["hashes"],
+                    "checkpoint": { "envelope": p["checkpoint"] }
+                },
+                "canonicalizedBody": t["body"]
+            }],
+            "timestampVerificationData": { "rfc3161Timestamps": [
+                { "signedTimestamp": native["timestamps"][0] }
+            ] }
+        },
+        "dsseEnvelope": {
+            "payload": native["envelope"]["payload"],
+            "payloadType": native["envelope"]["payloadType"],
+            "signatures": [{ "sig": native["envelope"]["signatures"][0]["sig"], "keyid": "" }]
+        }
+    })
+}
+
+#[test]
+#[ignore = "writes fixtures; run with PROMPTSIGN_APPROVAL_FIXTURES_OUT set"]
+fn write_approval_fixtures() {
+    use promptsign_core::approval::{statement, verify_approval, Rejected, IN_TOTO_PAYLOAD_TYPE};
+    use sha2::{Digest, Sha256};
+
+    let out = std::env::var_os("PROMPTSIGN_APPROVAL_FIXTURES_OUT")
+        .map(std::path::PathBuf::from)
+        .expect("set PROMPTSIGN_APPROVAL_FIXTURES_OUT to the fixture directory");
+    // The conformance skill's content listing, which listing.txt holds.
+    let listing = fs::read(out.join("listing.txt")).unwrap();
+    let digest: String = Sha256::digest(&listing)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let d = v2();
+    let signed = at("2026-10-01T12:00:00Z");
+    let root = Root::from_trusted_root("acme-v2", &d.trusted_root_v2()).unwrap();
+    let approval = |covers: &str, note: &str| {
+        serde_json::to_vec(&statement(
+            "demo-skill",
+            covers,
+            "2026-10-01T12:00:00Z",
+            Some(note),
+        ))
+        .unwrap()
+    };
+    let bob = d.sign_typed_payload_at(
+        IN_TOTO_PAYLOAD_TYPE,
+        &approval(&digest, "reviewed by bob"),
+        "bob@acme.test",
+        ACME_SSO,
+        signed,
+    );
+    let carol = to_sigstore(&d.sign_typed_payload_v2_at(
+        IN_TOTO_PAYLOAD_TYPE,
+        &approval(&digest, "reviewed by carol"),
+        "carol@acme.test",
+        ACME_SSO,
+        signed,
+    ));
+    let other = d.sign_typed_payload_at(
+        IN_TOTO_PAYLOAD_TYPE,
+        &approval(&"0".repeat(64), "an earlier version"),
+        "dave@acme.test",
+        ACME_SSO,
+        signed,
+    );
+
+    // The README's claims, checked against the core before anything is written.
+    for (bundle, who) in [(&bob, "bob@acme.test"), (&carol, "carol@acme.test")] {
+        let a = verify_approval(bundle, &digest, std::slice::from_ref(&root), signed).unwrap();
+
+        assert_eq!((a.identity.as_str(), a.root.as_str()), (who, "acme-v2"));
+    }
+    assert_eq!(
+        verify_approval(&other, &digest, std::slice::from_ref(&root), signed),
+        Err(Rejected::OtherContent)
+    );
+
+    write_json(&out.join("bob.json"), &bob);
+    write_json(&out.join("carol.sigstore.json"), &carol);
+    write_json(&out.join("other-content.json"), &other);
 }
