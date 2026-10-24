@@ -217,9 +217,8 @@ fn pem_bodies(pem: &str, label: &str) -> Result<Vec<Vec<u8>>> {
 /// Extract (identity, issuer) from a Fulcio-style leaf certificate.
 pub fn leaf_identity(leaf: &Certificate) -> Result<(String, String)> {
     let exts = leaf
-        .tbs_certificate
-        .extensions
-        .as_ref()
+        .tbs_certificate()
+        .extensions()
         .ok_or("leaf certificate has no extensions")?;
     let mut identity: Option<String> = None;
     let mut issuer: Option<String> = None;

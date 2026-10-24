@@ -319,8 +319,8 @@ fn matches_signer(cert: &Certificate, id: &SignerId) -> bool {
                 b[start..].to_vec()
             };
 
-            cert.tbs_certificate.issuer.to_der().ok().as_deref() == Some(*issuer)
-                && trim(cert.tbs_certificate.serial_number.as_bytes()) == trim(serial)
+            cert.tbs_certificate().issuer().to_der().ok().as_deref() == Some(*issuer)
+                && trim(cert.tbs_certificate().serial_number().as_bytes()) == trim(serial)
         }
         SignerId::KeyId(key_id) => extension(cert, OID_SUBJECT_KEY_ID)
             .and_then(|e| tlv::decode_one(e.extn_value.as_bytes(), tlv::OCTET_STRING).ok())

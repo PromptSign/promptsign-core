@@ -6,25 +6,28 @@
 
 #![allow(dead_code)]
 
+pub mod profile;
 pub mod v2;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use ed25519_dalek::pkcs8::EncodePublicKey as _;
 use ed25519_dalek::Signer as _;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::pkcs8::EncodePublicKey as _;
+use profile::Profile;
 use promptsign_core::bundle::{pae, PAYLOAD_TYPE};
 use promptsign_core::util::sha256_hex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::builder::Builder;
 use x509_cert::der::asn1::{Ia5String, Utf8StringRef};
 use x509_cert::der::oid::{AssociatedOid, ObjectIdentifier};
 use x509_cert::der::{Decode, Encode, EncodePem, Length, Writer};
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
-use x509_cert::ext::AsExtension;
+use x509_cert::ext::Criticality;
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
@@ -44,8 +47,8 @@ impl Encode for IssuerExt {
         Utf8StringRef::new(&self.0)?.encode(w)
     }
 }
-impl AsExtension for IssuerExt {
-    fn critical(&self, _: &Name, _: &[x509_cert::ext::Extension]) -> bool {
+impl Criticality for IssuerExt {
+    fn criticality(&self, _: &Name, _: &[x509_cert::ext::Extension]) -> bool {
         false
     }
 }
@@ -97,16 +100,15 @@ impl MockSigstore {
                 .as_bytes(),
         )
         .unwrap();
-        let ca_cert = CertificateBuilder::new(
+        let ca_cert = profile::builder(
             Profile::Root,
             SerialNumber::from(1u32),
             validity(not_before, not_after),
             ca_name.clone(),
             ca_spki,
-            &ca_key,
         )
         .unwrap()
-        .build::<p256::ecdsa::DerSignature>()
+        .build::<_, p256::ecdsa::DerSignature>(&ca_key)
         .unwrap();
         let log_key = p256::ecdsa::SigningKey::from_slice(&[seed.wrapping_add(1); 32]).unwrap();
         let (tsa_root_cert, tsa_key, tsa_cert) =
@@ -136,7 +138,7 @@ impl MockSigstore {
             key.verifying_key().to_public_key_der().unwrap().as_bytes(),
         )
         .unwrap();
-        let cert = CertificateBuilder::new(
+        let cert = profile::builder(
             Profile::SubCA {
                 issuer: self.ca_name.clone(),
                 path_len_constraint: Some(0),
@@ -145,10 +147,9 @@ impl MockSigstore {
             validity(1_735_689_600, 4_891_363_200),
             name.clone(),
             spki,
-            &self.ca_key,
         )
         .unwrap()
-        .build::<p256::ecdsa::DerSignature>()
+        .build::<_, p256::ecdsa::DerSignature>(&self.ca_key)
         .unwrap();
 
         self.intermediate = Some((key, name, cert));
@@ -254,7 +255,7 @@ impl MockSigstore {
             Some((key, name, _)) => (key, name),
             None => (&self.ca_key, &self.ca_name),
         };
-        let mut leaf = CertificateBuilder::new(
+        let mut leaf = profile::builder(
             Profile::Leaf {
                 issuer: issuer_name.clone(),
                 enable_key_agreement: false,
@@ -264,7 +265,6 @@ impl MockSigstore {
             validity(integrated_time - 60, integrated_time + 600),
             Name::from_str("CN=sigstore-intermediate").unwrap(),
             leaf_spki,
-            issuer_key,
         )
         .unwrap();
         let san = if identity.contains("://") {
@@ -276,7 +276,9 @@ impl MockSigstore {
         leaf.add_extension(&SubjectAltName(vec![san])).unwrap();
         leaf.add_extension(&IssuerExt(issuer.to_string())).unwrap();
 
-        let leaf_cert: Certificate = leaf.build::<p256::ecdsa::DerSignature>().unwrap();
+        let leaf_cert: Certificate = leaf
+            .build::<_, p256::ecdsa::DerSignature>(issuer_key)
+            .unwrap();
         let mut chain = vec![BASE64_STANDARD.encode(leaf_cert.to_der().unwrap())];
 
         if self.intermediate.is_some() {
@@ -370,10 +372,7 @@ pub(crate) fn validity(not_before: i64, not_after: i64) -> Validity {
         x509_cert::time::Time::try_from(UNIX_EPOCH + Duration::from_secs(t as u64)).unwrap()
     };
 
-    Validity {
-        not_before: at(not_before),
-        not_after: at(not_after),
-    }
+    Validity::new(at(not_before), at(not_after))
 }
 
 /// A fresh directory under the system temp dir. The counter keeps names

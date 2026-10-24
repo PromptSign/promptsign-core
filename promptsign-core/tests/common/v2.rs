@@ -3,15 +3,17 @@
 // own root. Ed25519 and RFC 6979 ECDSA are deterministic, so fixtures built
 // from these come out byte-identical on every run.
 
+use super::profile::{self, Profile};
 use super::{validity, IssuerExt, MockSigstore};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use ed25519_dalek::Signer as _;
+use p256::ecdsa::signature::Signer as _;
 use promptsign_core::bundle::{pae, PAYLOAD_TYPE};
 use promptsign_core::util::{format_iso8601, hex, sha256_hex};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
-use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::builder::Builder;
 use x509_cert::der::asn1::Ia5String;
 use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::{Decode, Encode};
@@ -51,19 +53,18 @@ pub(super) fn timestamp_authority(
 ) -> (Certificate, p256::ecdsa::SigningKey, Certificate) {
     let root_key = p256::ecdsa::SigningKey::from_slice(&[seed.wrapping_add(3); 32]).unwrap();
     let root_name = Name::from_str(&format!("CN={cn} TSA root,O=promptsign tests")).unwrap();
-    let root = CertificateBuilder::new(
+    let root = profile::builder(
         Profile::Root,
         SerialNumber::from(1u32),
         validity(not_before, not_after),
         root_name.clone(),
         p256_spki(&root_key),
-        &root_key,
     )
     .unwrap()
-    .build::<p256::ecdsa::DerSignature>()
+    .build::<_, p256::ecdsa::DerSignature>(&root_key)
     .unwrap();
     let key = p256::ecdsa::SigningKey::from_slice(&[seed.wrapping_add(4); 32]).unwrap();
-    let mut leaf = CertificateBuilder::new(
+    let mut leaf = profile::builder(
         Profile::Leaf {
             issuer: root_name,
             enable_key_agreement: false,
@@ -73,7 +74,6 @@ pub(super) fn timestamp_authority(
         validity(not_before, not_after),
         Name::from_str(&format!("CN={cn} TSA,O=promptsign tests")).unwrap(),
         p256_spki(&key),
-        &root_key,
     )
     .unwrap();
 
@@ -85,7 +85,8 @@ pub(super) fn timestamp_authority(
     (
         root,
         key,
-        leaf.build::<p256::ecdsa::DerSignature>().unwrap(),
+        leaf.build::<_, p256::ecdsa::DerSignature>(&root_key)
+            .unwrap(),
     )
 }
 
@@ -287,10 +288,10 @@ impl MockSigstore {
         let signer_info = seq(&[
             int(1),
             seq(&[
-                self.tsa_cert.tbs_certificate.issuer.to_der().unwrap(),
+                self.tsa_cert.tbs_certificate().issuer().to_der().unwrap(),
                 self.tsa_cert
-                    .tbs_certificate
-                    .serial_number
+                    .tbs_certificate()
+                    .serial_number()
                     .to_der()
                     .unwrap(),
             ]),
@@ -338,7 +339,7 @@ impl MockSigstore {
         issuer: &str,
         at: i64,
     ) -> Certificate {
-        let mut leaf = CertificateBuilder::new(
+        let mut leaf = profile::builder(
             Profile::Leaf {
                 issuer: self.ca_name.clone(),
                 enable_key_agreement: false,
@@ -348,7 +349,6 @@ impl MockSigstore {
             validity(at - 60, at + 600),
             Name::from_str("CN=sigstore-intermediate").unwrap(),
             p256_spki(key),
-            &self.ca_key,
         )
         .unwrap();
         let san = if identity.contains("://") {
@@ -359,7 +359,8 @@ impl MockSigstore {
 
         leaf.add_extension(&SubjectAltName(vec![san])).unwrap();
         leaf.add_extension(&IssuerExt(issuer.to_string())).unwrap();
-        leaf.build::<p256::ecdsa::DerSignature>().unwrap()
+        leaf.build::<_, p256::ecdsa::DerSignature>(&self.ca_key)
+            .unwrap()
     }
 
     /// A keyless PromptSign bundle logged in the Rekor v2 log as a
@@ -429,7 +430,7 @@ impl MockSigstore {
             "envelope": {
                 "payloadType": payload_type,
                 "payload": BASE64_STANDARD.encode(payload),
-                "signatures": [{ "keyid": sha256_hex(leaf.tbs_certificate.subject_public_key_info.to_der().unwrap().as_slice()), "sig": BASE64_STANDARD.encode(sig.as_bytes()) }]
+                "signatures": [{ "keyid": sha256_hex(leaf.tbs_certificate().subject_public_key_info().to_der().unwrap().as_slice()), "sig": BASE64_STANDARD.encode(sig.as_bytes()) }]
             },
             "signer": {
                 "scheme": "keyless",

@@ -18,12 +18,14 @@ getrandom.workspace = true
 base64.workspace = true
 unicode-normalization.workspace = true
 # keyless verification (still fully offline: parse/verify stapled certs + log proofs)
-x509-cert = { version = "0.2", features = ["pem"] }
-der = "0.7"
-p256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
+x509-cert = { version = "0.3", features = ["pem"] }
+der = "0.8"
+p256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
 # RSA chain links (enterprise CAs); verification only, no private-key operations
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-x509-cert = { version = "0.2", features = ["pem", "builder"] }
+x509-cert = { version = "0.3", features = ["pem", "builder"] }
+# p256 0.14 needs the oid feature of its sha2 to name ECDSA in test certificates.
+sha2-oid = { package = "sha2", version = "0.11", features = ["oid"] }

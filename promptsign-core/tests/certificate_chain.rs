@@ -13,7 +13,7 @@ use promptsign_core::trustroot::Root;
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::builder::Builder;
 use x509_cert::der::asn1::{Any, Ia5String, ObjectIdentifier, Utf8StringRef};
 use x509_cert::der::{Decode, Encode, EncodePem};
 use x509_cert::ext::pkix::name::{GeneralName, OtherName};
@@ -23,6 +23,10 @@ use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use x509_cert::Certificate;
+
+#[path = "common/profile.rs"]
+mod profile;
+use profile::Profile;
 
 const PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 
@@ -42,16 +46,15 @@ fn cert(
     subject_key: &SigningKey,
     issuer_key: &SigningKey,
 ) -> Certificate {
-    CertificateBuilder::new(
+    profile::builder(
         profile,
         SerialNumber::from(serial),
         Validity::from_now(Duration::from_secs(3600)).unwrap(),
         Name::from_str(subject).unwrap(),
         spki(subject_key),
-        issuer_key,
     )
     .unwrap()
-    .build::<DerSignature>()
+    .build::<_, DerSignature>(issuer_key)
     .unwrap()
 }
 
@@ -219,20 +222,22 @@ fn leaf_with_san(
     seed: u8,
 ) -> (Certificate, SigningKey) {
     let leaf_key = key(seed);
-    let mut builder = CertificateBuilder::new(
+    let mut builder = profile::builder(
         leaf_profile("CN=Corp Root,O=Corp"),
         SerialNumber::from(u32::from(seed)),
         Validity::from_now(Duration::from_secs(3600)).unwrap(),
         Name::from_str(subject).unwrap(),
         spki(&leaf_key),
-        &p.root_key,
     )
     .unwrap();
 
     if !names.is_empty() {
         builder.add_extension(&SubjectAltName(names)).unwrap();
     }
-    (builder.build::<DerSignature>().unwrap(), leaf_key)
+    (
+        builder.build::<_, DerSignature>(&p.root_key).unwrap(),
+        leaf_key,
+    )
 }
 
 fn upn(name: &str) -> GeneralName {

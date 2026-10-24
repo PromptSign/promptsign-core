@@ -6,24 +6,29 @@ use base64::prelude::{Engine as _, BASE64_STANDARD};
 use ed25519_dalek::pkcs8::EncodePublicKey as _;
 use ed25519_dalek::Signer as _;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::pkcs8::EncodePublicKey as _;
+use profile::Profile;
 use promptsign_core::bundle::{pae, verify_envelope, PAYLOAD_TYPE};
 use promptsign_core::util::sha256_hex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::time::Duration;
-use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::builder::Builder;
 use x509_cert::der::asn1::{Ia5String, Utf8StringRef};
 use x509_cert::der::oid::{AssociatedOid, ObjectIdentifier};
 use x509_cert::der::{Encode, EncodePem, Length, Writer};
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
-use x509_cert::ext::AsExtension;
+use x509_cert::ext::Criticality;
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use x509_cert::Certificate;
+
+#[path = "common/profile.rs"]
+mod profile;
 
 struct IssuerExt(String);
 
@@ -38,8 +43,8 @@ impl Encode for IssuerExt {
         Utf8StringRef::new(&self.0)?.encode(w)
     }
 }
-impl AsExtension for IssuerExt {
-    fn critical(&self, _: &Name, _: &[x509_cert::ext::Extension]) -> bool {
+impl Criticality for IssuerExt {
+    fn criticality(&self, _: &Name, _: &[x509_cert::ext::Extension]) -> bool {
         false
     }
 }
@@ -65,20 +70,19 @@ fn keyless_verify_end_to_end() {
         )
         .unwrap()
     };
-    let ca_cert: Certificate = CertificateBuilder::new(
+    let ca_cert: Certificate = profile::builder(
         Profile::Root,
         SerialNumber::from(1u32),
         Validity::from_now(Duration::from_secs(3600 * 24 * 365)).unwrap(),
         ca_name.clone(),
         ca_spki,
-        &ca_key,
     )
     .unwrap()
-    .build::<p256::ecdsa::DerSignature>()
+    .build::<_, p256::ecdsa::DerSignature>(&ca_key)
     .unwrap();
 
     let leaf_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-    let mut leaf_builder = CertificateBuilder::new(
+    let mut leaf_builder = profile::builder(
         Profile::Leaf {
             issuer: ca_name.clone(),
             enable_key_agreement: false,
@@ -88,7 +92,6 @@ fn keyless_verify_end_to_end() {
         Validity::from_now(Duration::from_secs(600)).unwrap(),
         Name::from_str("CN=sigstore-intermediate").unwrap(),
         spki_of_ed25519(&leaf_key.verifying_key()),
-        &ca_key,
     )
     .unwrap();
 
@@ -101,7 +104,9 @@ fn keyless_verify_end_to_end() {
         .add_extension(&IssuerExt("https://accounts.example.com".to_string()))
         .unwrap();
 
-    let leaf_cert: Certificate = leaf_builder.build::<p256::ecdsa::DerSignature>().unwrap();
+    let leaf_cert: Certificate = leaf_builder
+        .build::<_, p256::ecdsa::DerSignature>(&ca_key)
+        .unwrap();
 
     // --- envelope over a minimal manifest ---
     let manifest = json!({
@@ -261,18 +266,17 @@ fn keyless_verify_end_to_end() {
         )
         .unwrap()
     };
-    let _rogue_cert: Certificate = CertificateBuilder::new(
+    let _rogue_cert: Certificate = profile::builder(
         Profile::Root,
         SerialNumber::from(9u32),
         Validity::from_now(Duration::from_secs(3600)).unwrap(),
         rogue_name.clone(),
         rogue_spki,
-        &rogue_ca,
     )
     .unwrap()
-    .build::<p256::ecdsa::DerSignature>()
+    .build::<_, p256::ecdsa::DerSignature>(&rogue_ca)
     .unwrap();
-    let mut rogue_leaf_builder = CertificateBuilder::new(
+    let mut rogue_leaf_builder = profile::builder(
         Profile::Leaf {
             issuer: rogue_name,
             enable_key_agreement: false,
@@ -282,7 +286,6 @@ fn keyless_verify_end_to_end() {
         Validity::from_now(Duration::from_secs(600)).unwrap(),
         Name::from_str("CN=rogue-leaf").unwrap(),
         spki_of_ed25519(&leaf_key.verifying_key()),
-        &rogue_ca,
     )
     .unwrap();
 
@@ -296,7 +299,7 @@ fn keyless_verify_end_to_end() {
         .unwrap();
 
     let rogue_leaf: Certificate = rogue_leaf_builder
-        .build::<p256::ecdsa::DerSignature>()
+        .build::<_, p256::ecdsa::DerSignature>(&rogue_ca)
         .unwrap();
     let mut rogue_bundle = bundle.clone();
 

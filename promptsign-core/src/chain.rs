@@ -41,14 +41,14 @@ pub(crate) const OID_SHA512: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 
 pub(crate) fn spki_der_of(cert: &Certificate) -> Result<Vec<u8>> {
-    cert.tbs_certificate
-        .subject_public_key_info
+    cert.tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|e| format!("SPKI encode: {e}"))
 }
 
 pub(crate) fn subject_of(cert: &Certificate) -> String {
-    cert.tbs_certificate.subject.to_string()
+    cert.tbs_certificate().subject().to_string()
 }
 
 /// A certificate-mode signer's identity (spec/07 §3.2): the SAN's first
@@ -57,9 +57,9 @@ pub(crate) fn subject_of(cert: &Certificate) -> String {
 /// SAN, so policies match `alice@corp.com` as they do for keyless signers.
 pub(crate) fn certificate_identity(cert: &Certificate) -> String {
     let names = cert
-        .tbs_certificate
-        .extensions
-        .iter()
+        .tbs_certificate()
+        .extensions()
+        .into_iter()
         .flatten()
         .find(|e| e.extn_id == OID_SAN)
         .and_then(|e| SubjectAltName::from_der(e.extn_value.as_bytes()).ok())
@@ -87,8 +87,8 @@ pub(crate) fn certificate_identity(cert: &Certificate) -> String {
 }
 
 fn ec_curve(cert: &Certificate) -> Result<ObjectIdentifier> {
-    cert.tbs_certificate
-        .subject_public_key_info
+    cert.tbs_certificate()
+        .subject_public_key_info()
         .algorithm
         .parameters
         .as_ref()
@@ -100,15 +100,15 @@ fn ec_curve(cert: &Certificate) -> Result<ObjectIdentifier> {
 /// Verify that `child`'s signature was produced by the holder of `parent`'s key.
 pub(crate) fn verify_signed_by(child: &Certificate, parent: &Certificate) -> Result<()> {
     let tbs = child
-        .tbs_certificate
+        .tbs_certificate()
         .to_der()
         .map_err(|e| format!("TBS encode: {e}"))?;
     let sig = child
-        .signature
+        .signature()
         .as_bytes()
         .ok_or("certificate signature has unused bits")?;
     let parent_spki_der = spki_der_of(parent)?;
-    let sig_alg = child.signature_algorithm.oid;
+    let sig_alg = child.signature_algorithm().oid;
 
     if sig_alg == OID_ED25519 {
         use ed25519_dalek::pkcs8::DecodePublicKey;
@@ -131,7 +131,13 @@ pub(crate) fn verify_signed_by(child: &Certificate, parent: &Certificate) -> Res
             "unsupported certificate signature algorithm: {sig_alg}"
         ));
     }
-    if parent.tbs_certificate.subject_public_key_info.algorithm.oid != OID_EC_PUBLIC_KEY {
+    if parent
+        .tbs_certificate()
+        .subject_public_key_info()
+        .algorithm
+        .oid
+        != OID_EC_PUBLIC_KEY
+    {
         return Err("parent key is not an EC key".to_string());
     }
 
@@ -206,7 +212,7 @@ fn verify_ecdsa_prehash(
 /// Verify a DSSE signature with the leaf certificate's key: Ed25519, P-256
 /// with SHA-256, or P-384 with SHA-384 (the hash follows the curve).
 pub(crate) fn verify_leaf_signature(leaf: &Certificate, message: &[u8], sig: &[u8]) -> Result<()> {
-    let spki = &leaf.tbs_certificate.subject_public_key_info;
+    let spki = leaf.tbs_certificate().subject_public_key_info();
     let spki_der = spki_der_of(leaf)?;
 
     if spki.algorithm.oid == OID_ED25519 {
@@ -314,7 +320,13 @@ pub(crate) fn verify_cms_signature(
         return Err(format!("unsupported signature algorithm: {sig_alg}"));
     };
 
-    if cert.tbs_certificate.subject_public_key_info.algorithm.oid != OID_EC_PUBLIC_KEY {
+    if cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .algorithm
+        .oid
+        != OID_EC_PUBLIC_KEY
+    {
         return Err("signing certificate does not hold an EC key".to_string());
     }
     verify_ecdsa_prehash(
@@ -330,8 +342,8 @@ pub(crate) fn extension(
     cert: &Certificate,
     oid: ObjectIdentifier,
 ) -> Option<&x509_cert::ext::Extension> {
-    cert.tbs_certificate
-        .extensions
+    cert.tbs_certificate()
+        .extensions()
         .as_ref()?
         .iter()
         .find(|e| e.extn_id == oid)
@@ -404,7 +416,7 @@ pub(crate) fn check_signing_leaf(leaf: &Certificate) -> Result<()> {
 }
 
 pub(crate) fn validity(cert: &Certificate) -> (i64, i64) {
-    let v = &cert.tbs_certificate.validity;
+    let v = cert.tbs_certificate().validity();
 
     (
         v.not_before.to_unix_duration().as_secs() as i64,
@@ -428,7 +440,7 @@ pub(crate) fn check_valid_at(path: &[Certificate], at: i64) -> Result<()> {
 }
 
 pub(crate) fn is_self_signed(cert: &Certificate) -> bool {
-    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
+    cert.tbs_certificate().subject() == cert.tbs_certificate().issuer()
         && verify_signed_by(cert, cert).is_ok()
 }
 
@@ -487,7 +499,7 @@ pub(crate) fn anchor_chain<'r>(
     if anchored.is_empty() {
         return Err(format!(
             "certificate chain does not terminate at a trusted root: it ends at \"{}\", which is not in your trust roots (add it with \"promptsign trust add\" if you trust it)",
-            last.tbs_certificate.issuer
+            last.tbs_certificate().issuer()
         ));
     }
     Ok(anchored)
