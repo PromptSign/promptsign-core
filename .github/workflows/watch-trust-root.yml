@@ -52,6 +52,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       # Exits non-zero only when Sigstore could not be reached, in which case
       # nothing was compared and there is nothing to review. Drift is reported

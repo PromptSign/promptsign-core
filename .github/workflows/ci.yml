@@ -30,6 +30,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       - uses: Swatinem/rust-cache@v2
 
@@ -48,6 +49,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       - uses: Swatinem/rust-cache@v2
 
@@ -76,6 +78,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       - uses: Swatinem/rust-cache@v2
 
@@ -104,6 +107,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       - run: node scripts/sync-trust.mjs --check
 
@@ -119,6 +123,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       - run: npx prettier@3.9.6 --check "promptsign-napi/**/*.{mjs,cjs,ts}" "scripts/*.mjs"
 

@@ -70,6 +70,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
 
       # musl targets build in a container via `cross` (bundles the musl
       # toolchains for both x64 and arm64); everything else uses plain cargo.
@@ -111,6 +112,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          check-latest: true
           registry-url: https://registry.npmjs.org
 
       - name: download prebuilt binaries
